@@ -148,6 +148,8 @@ modules/leak_detector/yara_rules/compiled
 
 # ignore warden configuration file
 modules/CESNET/warden.conf
+# Anomaly detection saved to disk models
+modules/anomaly-detection/anomaly-detection-model
 
 # For RisqIQ credentinals
 credentials
