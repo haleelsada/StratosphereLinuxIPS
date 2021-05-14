@@ -996,7 +996,7 @@ class Main:
             open_servers:dict = self.print_open_redis_servers()
             if not open_servers:
                 self.terminate_slips()
-                
+
             server_to_close = input()
             # close all ports in running_slips_logs.txt and in our supported range
             if server_to_close == '0':
