@@ -436,6 +436,14 @@ If you use the latest Dockerfile, it will be set by default. If not, you can set
 
 
 
+### Anomaly Detection
+
+The ```anomaly_detection_mode= training``` should be used to tell the module that the flows received are all for training.
+
+The ```anomaly_detection_mode= testing``` should be used after training the models, to test unknown data. 
+
+```Testing``` is the default mode.
+
 ### VirusTotal
 
 In order for virustotal module to work, you need to add your VirusTotal API key to the file
