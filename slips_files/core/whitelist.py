@@ -1,22 +1,21 @@
 import json
-import configparser
-from .database import __database__
+from slips_files.core.database.database import __database__
+from slips_files.common.config_parser import ConfigParser
 import ipaddress
 import validators
-import requests
+from slips_files.common.slips_utils import utils
 import re
 import os
 
 
 class Whitelist:
-    def __init__(self, outputqueue, config, redis_port):
+    def __init__(self, outputqueue, redis_port):
         self.name = 'whitelist'
         self.outputqueue = outputqueue
-        self.config = config
         self.read_configuration()
         self.org_info_path = 'slips_files/organizations_info/'
         self.ignored_flow_types = ('arp')
-        __database__.start(self.config, redis_port)
+        __database__.start(redis_port)
 
 
     def print(self, text, verbose=1, debug=0):
@@ -40,17 +39,8 @@ class Whitelist:
         self.outputqueue.put(f'{levels}|{self.name}|{text}')
 
     def read_configuration(self):
-        """Read the configuration file for what we need"""
-        try:
-            self.whitelist_path = self.config.get(
-                'parameters', 'whitelist_path'
-            )
-        except (
-            configparser.NoOptionError,
-            configparser.NoSectionError,
-            NameError,
-        ):
-            self.whitelist_path = 'whitelist.conf'
+        conf = ConfigParser()
+        self.whitelist_path = conf.whitelist_path()
 
     def is_whitelisted_asn(self, ip, org):
         ip_data = __database__.getIPData(ip)
@@ -72,95 +62,121 @@ class Whitelist:
 
     def is_ignored_flow_type(self, flow_type) -> bool:
         """
-        Function reduce the number of checks we make if we fon't need to check this type of flow
+        Function reduce the number of checks we make if we don't need to check this type of flow
         """
         if flow_type in self.ignored_flow_types:
             return True
+
+
+    def is_whitelisted_domain_in_flow(self, whitelisted_domain, direction, domains_of_flow, ignore_type):
+        """
+        Given the domain of a flow, and a whitelisted domain,
+        this function checks any of the flow domains
+        is a subdomain or the same domain as the whitelisted domain
+
+        :param whitelisted_domain: the domain we want to check if it exists in the domains_of_flow
+        :param ignore_type: alerts or flows or both
+        :param direction: src or dst or both
+        :param domains_of_flow: src domains of the src IP of the flow,
+                                or dst domains of the dst IP of the flow
+        """
+        whitelisted_domains = __database__.get_whitelist('domains')
+        if not whitelisted_domains:
+            return False
+
+        # do we wanna whitelist flows coming from or going to this domain or both?
+        from_ = whitelisted_domains[whitelisted_domain]['from']
+        what_to_ignore = whitelisted_domains[whitelisted_domain]['what_to_ignore']
+
+        # Now check the domains of the src IP
+        if direction in from_ or 'both' in from_:
+            for domain_to_check in domains_of_flow:
+                main_domain = domain_to_check[-len(whitelisted_domain) :]
+                if whitelisted_domain in main_domain:
+                    # We can ignore flows or alerts, what is it?
+                    if (
+                        ignore_type in what_to_ignore
+                        or 'both' in what_to_ignore
+                    ):
+                        return True
+        return False
+
+    def is_whitelisted_domain(self, domain_to_check, saddr, daddr, ignore_type):
+        """
+        :param domain_to_check: the domain we want to know if whitelisted or not
+        :param saddr: saddr of the flow we're checking
+        :param daddr: daddr of the flow we're checking
+        :param ignore_type: alerts or flows or both
+        """
+
+        whitelisted_domains = __database__.get_whitelist('domains')
+        if not whitelisted_domains:
+            return False
+
+        # get the domains of this flow
+        (
+            dst_domains_of_flow,
+            src_domains_of_flow,
+        ) = self.get_domains_of_flow(saddr, daddr)
+
+        # self.print(f'Domains to check from flow: {domains_to_check}, {domains_to_check_dst} {domains_to_check_src}')
+        # Go through each whitelisted domain and check if what arrived is there
+        for whitelisted_domain in list(whitelisted_domains.keys()):
+            what_to_ignore = whitelisted_domains[whitelisted_domain]['what_to_ignore']
+            # Here we iterate over all the domains to check if we can find
+            # subdomains. If slack.com was whitelisted, then test.slack.com
+            # should be ignored too. But not 'slack.com.test'
+            main_domain = domain_to_check[-len(whitelisted_domain) :]
+            if whitelisted_domain in main_domain:
+                # We can ignore flows or alerts, what is it?
+                if (
+                    ignore_type in what_to_ignore
+                    or 'both' in what_to_ignore
+                ):
+                    # self.print(f'Whitelisting the domain {domain_to_check} due to whitelist of {domain}')
+                    return True
+
+
+            if self.is_whitelisted_domain_in_flow(whitelisted_domain, 'src', src_domains_of_flow, ignore_type):
+                # self.print(f"Whitelisting the domain {domain_to_check} because is related"
+                #            f" to domain {domain} of dst IP {column_values['daddr']}")
+                return True
+
+            if self.is_whitelisted_domain_in_flow(whitelisted_domain, 'dst', dst_domains_of_flow, ignore_type):
+                # self.print(f"Whitelisting the domain {domain_to_check} because is
+                # related to domain {domain} of src IP {column_values['saddr']}")
+                return True
+        return False
 
 
     def is_whitelisted_flow(self, column_values, flow_type) -> bool:
         """
         Checks if the src IP or dst IP or domain or organization of this flow is whitelisted.
         """
+        saddr = column_values.get('saddr', '')
+        daddr = column_values.get('daddr', '')
+        # get the domains of the IPs this flow
+        (
+            domains_to_check_dst,
+            domains_to_check_src,
+        ) = self.get_domains_of_flow(saddr, daddr)
 
-        if whitelisted_domains := __database__.get_whitelist('domains'):
-            ssl_domain = column_values.get('server_name', '')  # ssl.log
-            # Domain names are stored in different zeek files using different names.
-            # Try to get the domain from each file.            domains_to_check = [ssl_domain]
-            domains_to_check = [ssl_domain]
-            http_domain = column_values.get('host', '')  # http.log
-            domains_to_check.append(http_domain)
-            notice_domain = column_values.get('sub', '').replace(
-                'CN=', ''
-            )  # in notice.log
-            domains_to_check.append(notice_domain)
+        # check if we have whitelisted domains
 
-            (
-                domains_to_check_dst,
-                domains_to_check_src,
-            ) = self.get_domains_of_flow(column_values)
+        # first get the domains of the flows we ewnt to check if whitelisted
+        # Domain names are stored in different zeek files using different names.
+        # Try to get the domain from each file.
+        ssl_domain = column_values.get('server_name', '')  # ssl.log
+        http_domain = column_values.get('host', '')  # http.log
+        notice_domain = column_values.get('sub', '').replace(
+            'CN=', ''
+        )  # in notice.log
+        domains_to_check = [ssl_domain, http_domain, notice_domain]
 
-            try:
-                # self.print(f"DNS of dst IP {column_values['daddr']}: {__database__.get_dns_resolution(column_values['daddr'])}")
-                dst_dns_domains = __database__.get_reverse_dns(
-                    column_values['daddr']
-                )
-                dst_dns_domains = dst_dns_domains.get('domains', [])
-                for dns_domain in dst_dns_domains:
-                    domains_to_check_dst.append(dns_domain)
-            except (KeyError, TypeError):
-                pass
+        for domain in domains_to_check:
+            if self.is_whitelisted_domain(domain, saddr, daddr, 'flows'):
+                return True
 
-            # self.print(f'Domains to check from flow: {domains_to_check}, {domains_to_check_dst} {domains_to_check_src}')
-            # Go through each whitelisted domain and check if what arrived is there
-            for domain in list(whitelisted_domains.keys()):
-                what_to_ignore = whitelisted_domains[domain]['what_to_ignore']
-                # Here we iterate over all the domains to check so we can find
-                # subdomains. If slack.com was whitelisted, then test.slack.com
-                # should be ignored too. But not 'slack.com.test'
-                for domain_to_check in domains_to_check:
-                    main_domain = domain_to_check[-len(domain) :]
-                    if domain in main_domain:
-                        # We can ignore flows or alerts, what is it?
-                        if (
-                            'flows' in what_to_ignore
-                            or 'both' in what_to_ignore
-                        ):
-                            # self.print(f'Whitelisting the domain {domain_to_check} due to whitelist of {domain}')
-                            return True
-
-                # do we wanna whitelist flows coming from or going to this domain or both?
-                from_ = whitelisted_domains[domain]['from']
-
-                # Now check the related domains of the src IP
-                if 'src' in from_ or 'both' in from_:
-                    for domain_to_check in domains_to_check_src:
-                        main_domain = domain_to_check[-len(domain) :]
-                        if domain in main_domain:
-                            # We can ignore flows or alerts, what is it?
-                            if (
-                                'flows' in what_to_ignore
-                                or 'both' in what_to_ignore
-                            ):
-                                # self.print(f"Whitelisting the domain {domain_to_check} because is related to domain {domain} of src IP {column_values['saddr']}")
-                                return True
-
-                # Now check the related domains of the dst IP
-                if 'dst' in from_ or 'both' in from_:
-                    for domain_to_check in domains_to_check_dst:
-                        main_domain = domain_to_check[-len(domain) :]
-                        if domain in main_domain:
-                            # We can ignore flows or alerts, what is it?
-                            if (
-                                'flows' in what_to_ignore
-                                or 'both' in what_to_ignore
-                            ):
-                                # self.print(f"Whitelisting the domain {domain_to_check} because is related"
-                                #            f" to domain {domain} of dst IP {column_values['daddr']}")
-                                return True
-
-        saddr = column_values['saddr']
-        daddr = column_values['daddr']
 
         if whitelisted_IPs := __database__.get_whitelist('IPs'):
             # self.print('Check the IPs')
@@ -187,28 +203,43 @@ class Whitelist:
                     # self.print(f"Whitelisting the dst IP {column_values['daddr']}")
                     return True
 
-        if whitelisted_mac := __database__.get_whitelist('mac'):
+        if whitelisted_macs := __database__.get_whitelist('mac'):
             # try to get the mac address of the current flow
             src_mac = column_values.get('src_mac', False)
             if not src_mac:
                 src_mac = column_values.get('mac', False)
+
             if not src_mac:
                 src_mac = __database__.get_mac_addr_from_profile(
                     f'profile_{saddr}'
-                )[0]
+                )
+                if src_mac:
+                    src_mac = src_mac[0]
 
-            if src_mac and src_mac in list(whitelisted_mac.keys()):
+            if src_mac and src_mac in list(whitelisted_macs.keys()):
                 # the src mac of this flow is whitelisted, but which direction?
-                from_ = whitelisted_mac[src_mac]['from']
-                if 'src' in from_ or 'both' in from_:
+                from_ = whitelisted_macs[src_mac]['from']
+                what_to_ignore = whitelisted_macs[src_mac]['what_to_ignore']
+
+                if (
+                    ('src' in from_ or 'both' in from_)
+                    and
+                    ('flows' in what_to_ignore or 'both' in what_to_ignore)
+                ):
                     # self.print(f"The source MAC of this flow {src_mac} is whitelisted")
                     return True
 
             dst_mac = column_values.get('dst_mac', False)
-            if dst_mac and dst_mac in list(whitelisted_mac.keys()):
+            if dst_mac and dst_mac in list(whitelisted_macs.keys()):
                 # the dst mac of this flow is whitelisted, but which direction?
-                from_ = whitelisted_mac[dst_mac]['from']
-                if 'dst' in from_ or 'both' in from_:
+                from_ = whitelisted_macs[dst_mac]['from']
+                what_to_ignore = whitelisted_macs[dst_mac]['what_to_ignore']
+
+                if (
+                    ('dst' in from_ or 'both' in from_)
+                    and
+                    ('flows' in what_to_ignore or 'both' in what_to_ignore)
+                ):
                     # self.print(f"The dst MAC of this flow {dst_mac} is whitelisted")
                     return True
 
@@ -227,11 +258,7 @@ class Whitelist:
                 ]  # flows, alerts or both
                 # self.print(f'Checking {org}, from:{from_} type {what_to_ignore}')
 
-                # get the domains of this flow
-                (
-                    domains_to_check_dst,
-                    domains_to_check_src,
-                ) = self.get_domains_of_flow(column_values)
+
 
                 if 'flows' in what_to_ignore or 'both' in what_to_ignore:
                     # We want to block flows from this org. get the domains of this flow based on the direction.
@@ -265,7 +292,7 @@ class Whitelist:
                         try:
                             if self.is_ip_in_org(column_values['daddr'], org):
                                 # self.print(f"The dst IP {column_values['daddr']} "
-                                # f"is in the range {network} or org {org}. Whitelisted.")
+                                # f"is in the network range of org {org}. Whitelisted.")
                                 return True
                         except ValueError:
                             # Some flows don't have IPs, but mac address or just - in some cases
@@ -324,16 +351,14 @@ class Whitelist:
         whitelisted_domains = __database__.get_whitelist('domains')
         whitelisted_orgs = __database__.get_whitelist('organizations')
         whitelisted_mac = __database__.get_whitelist('mac')
-
+        # Process lines after comments
+        line_number = 0
         try:
             with open(self.whitelist_path) as whitelist:
-                # Process lines after comments
-                line_number = 0
-                line = whitelist.readline()
-                while line:
+                # line = whitelist.readline()
+                while line := whitelist.readline():
                     line_number += 1
                     if line.startswith('"IoCType"'):
-                        line = whitelist.readline()
                         continue
 
                     # check if the user commented an org, ip or domain that was whitelisted
@@ -378,8 +403,8 @@ class Whitelist:
                                     whitelisted_orgs.pop(org)
                                     break
 
-                        # todo if the user closes slips, changes the whitelist, and reopens slips , slips will still have the old whitelist in the cache!
-                        line = whitelist.readline()
+                        # todo if the user closes slips, changes the whitelist, and reopens slips ,
+                        #  slips will still have the old whitelist in the cache!
                         continue
                     # line should be: ["type","domain/ip/organization","from","what_to_ignore"]
                     line = line.replace('\n', '').replace(' ', '').split(',')
@@ -395,7 +420,6 @@ class Whitelist:
                         self.print(
                             f'Line {line_number} in whitelist.conf is missing a column. Skipping.'
                         )
-                        line = whitelist.readline()
                         continue
 
                     # Validate the type before processing
@@ -419,6 +443,9 @@ class Whitelist:
                                 'what_to_ignore': what_to_ignore,
                             }
                         elif 'org' in type_:
+                            if data not in utils.supported_orgs:
+                                self.print(f"Whitelisted org {data} is not supported in slips")
+                                continue
                             # organizations dicts look something like this:
                             #  {'google': {'from':'dst',
                             #               'what_to_ignore': 'alerts'
@@ -440,15 +467,14 @@ class Whitelist:
                             self.print(f'{data} is not a valid {type_}.', 1, 0)
                     except:
                         self.print(
-                            f'Line {line_number} in whitelist.conf is invalid. Skipping.'
+                            f'Line {line_number} in whitelist.conf is invalid. Skipping. '
                         )
-                    line = whitelist.readline()
         except FileNotFoundError:
             self.print(
                 f"Can't find {self.whitelist_path}, using slips default whitelist.conf instead"
             )
-            if self.whitelist_path != 'whitelist.conf':
-                self.whitelist_path = 'whitelist.conf'
+            if self.whitelist_path != 'config/whitelist.conf':
+                self.whitelist_path = 'config/whitelist.conf'
                 self.read_whitelist()
 
         # store everything in the cache db because we'll be needing this info in the evidenceProcess
@@ -459,25 +485,23 @@ class Whitelist:
 
         return line_number
 
-    def get_domains_of_flow(self, column_values):
+    def get_domains_of_flow(self, saddr, daddr):
         """Returns the domains of each ip (src and dst) that appeard in this flow"""
         # These separate lists, hold the domains that we should only check if they are SRC or DST. Not both
         domains_to_check_src = []
         domains_to_check_dst = []
         try:
             # self.print(f"IPData of src IP {column_values['saddr']}: {__database__.getIPData(column_values['saddr'])}")
-            ip_data = __database__.getIPData(column_values['saddr'])
+            ip_data = __database__.getIPData(saddr)
             if ip_data:
                 sni_info = ip_data.get('SNI', [{}])[0]
                 if sni_info:
-                    domains_to_check_src.append(sni_info.get('server_name'))
+                    domains_to_check_src.append(sni_info.get('server_name', ''))
         except (KeyError, TypeError):
             pass
         try:
             # self.print(f"DNS of src IP {column_values['saddr']}: {__database__.get_dns_resolution(column_values['saddr'])}")
-            src_dns_domains = __database__.get_reverse_dns(
-                column_values['saddr']
-            )
+            src_dns_domains = __database__.get_dns_resolution(saddr)
             src_dns_domains = src_dns_domains.get('domains', [])
             for dns_domain in src_dns_domains:
                 domains_to_check_src.append(dns_domain)
@@ -485,13 +509,23 @@ class Whitelist:
             pass
         try:
             # self.print(f"IPData of dst IP {column_values['daddr']}: {__database__.getIPData(column_values['daddr'])}")
-            ip_data = __database__.getIPData(column_values['daddr'])
+            ip_data = __database__.getIPData(daddr)
             if ip_data:
                 sni_info = ip_data.get('SNI', [{}])[0]
                 if sni_info:
                     domains_to_check_dst.append(sni_info.get('server_name'))
         except (KeyError, TypeError):
             pass
+
+        try:
+            # self.print(f"DNS of dst IP {column_values['daddr']}: {__database__.get_dns_resolution(column_values['daddr'])}")
+            dst_dns_domains = __database__.get_dns_resolution(daddr)
+            dst_dns_domains = dst_dns_domains.get('domains', [])
+            for dns_domain in dst_dns_domains:
+                domains_to_check_dst.append(dns_domain)
+        except (KeyError, TypeError):
+            pass
+
         return domains_to_check_dst, domains_to_check_src
 
 
@@ -513,7 +547,42 @@ class Whitelist:
             if ip_obj in ipaddress.ip_network(range):
                 return True
         return False
+    
+    def profile_has_whitelisted_mac(
+            self, profile_ip, whitelisted_macs, is_srcip, is_dstip
+    ) -> bool:
+        """
+        Checks for alerts whitelist
+        """
+        mac = __database__.get_mac_addr_from_profile(
+            f'profile_{profile_ip}'
+        )
+        
+        if not mac:
+            # we have no mac for this profile
+            return False
 
+        mac = mac[0]
+        if mac in list(whitelisted_macs.keys()):
+            # src or dst and
+            from_ = whitelisted_macs[mac]['from']
+            what_to_ignore = whitelisted_macs[mac]['what_to_ignore']
+            # do we want to whitelist alerts?
+            if (
+                'alerts' in what_to_ignore
+                or 'both' in what_to_ignore
+            ):
+                if is_srcip and (
+                    'src' in from_ or 'both' in from_
+                ):
+                    return True
+                if is_dstip and (
+                    'dst' in from_ or 'both' in from_
+                ):
+                    return True
+
+    
+    
     def is_whitelisted_evidence(
             self, srcip, data, type_detection, description
         ) -> bool:
@@ -537,7 +606,7 @@ class Whitelist:
                 # try max 10 times to get the whitelist, if it's still empty then it's not empty by mistake
                 max_tries -= 1
                 whitelist = __database__.get_all_whitelist()
-            if max_tries is 0:
+            if max_tries == 0:
                 # we tried 10 times to get the whitelist, it's probably empty.
                 return False
 
@@ -556,9 +625,9 @@ class Whitelist:
             except (IndexError, KeyError):
                 whitelisted_orgs = {}
             try:
-                whitelisted_mac = json.loads(whitelist['mac'])
+                whitelisted_macs = json.loads(whitelist['mac'])
             except (IndexError, KeyError):
-                whitelisted_mac = {}
+                whitelisted_macs = {}
 
             # Set data type
             if 'domain' in type_detection:
@@ -623,30 +692,13 @@ class Whitelist:
 
                     # Now we know this ipv4 or ipv6 isn't whitelisted
                     # is the mac address of this ip whitelisted?
-                    if whitelisted_mac:
-                        # getthe mac addr of this ip from our db
+                    if whitelisted_macs:
+                        # get the mac addr of this profile from our db
                         # this mac can be src or dst mac, based on the type of ip (is_srcip or is_dstip)
-                        mac = __database__.get_mac_addr_from_profile(
-                            f'profile_{ip}'
-                        )[0]
-                        if mac and mac in list(whitelisted_mac.keys()):
-                            # src or dst and
-                            from_ = whitelisted_mac[mac]['from']
-                            what_to_ignore = whitelisted_mac[mac]['what_to_ignore']
-                            # do we want to whitelist alerts?
-                            if (
-                                'alerts' in what_to_ignore
-                                or 'both' in what_to_ignore
-                            ):
-                                if is_srcip and (
-                                    'src' in from_ or 'both' in from_
-                                ):
-                                    return True
-                                if is_dstip and (
-                                    'dst' in from_ or 'both' in from_
-                                ):
-                                    return True
-
+                        if self.profile_has_whitelisted_mac(ip, whitelisted_macs, is_srcip, is_dstip):
+                            return True
+                        
+                        
             # Check domains
             if data_type == 'domain':
                 is_srcdomain = type_detection in ('srcdomain')
@@ -679,6 +731,14 @@ class Whitelist:
                         if ignore_alerts_from_domain or ignore_alerts_to_domain:
                             # self.print(f'Whitelisting evidence about {domain_in_whitelist}, due to a connection related to {data} in {description}')
                             return True
+
+                # remove the www. because no tranco whitelist entry has it
+                domain = domain.replace('www.','')
+                if __database__.is_whitelisted_tranco_domain(domain):
+                    # tranco list contains the top 10k known benign domains
+                    # https://tranco-list.eu/list/X5QNN/1000000
+                    return True
+
             # Check orgs
             if whitelisted_orgs:
                 is_src = type_detection in (
@@ -812,51 +872,6 @@ class Whitelist:
         __database__.set_org_info(org, json.dumps(domains), 'domains')
         return domains
 
-    def get_org_ipranges_online(self, org):
-        return False
-        org_subnets = {}
-        org_info_file = os.path.join(self.org_info_path, org)
-        # see if we can get asn about this org
-        try:
-            url = f'https://asn-lookup.p.rapidapi.com/api&orgname={org}'
-            headers = {
-                'X-RapidAPI-Host': 'asn-lookup.p.rapidapi.com',
-                'X-RapidAPI-Key': self.asnlookup_api_key
-            }
-            response = requests.get(
-                url,
-                headers=headers,
-                timeout=10,
-            )
-            if response.status_code != 200:
-                return
-            ip_space = json.loads(response.text)
-            if not ip_space:
-                return
-
-            with open(org_info_file, 'w') as f:
-                for subnet in ip_space:
-                    # get ipv4 only
-                    if ':' not in subnet and '.' in subnet:
-                        try:
-                            # make sure this line is a valid network
-                            ipaddress.ip_network(subnet)
-                        except ValueError:
-                            # not a valid line, ignore it
-                            continue
-
-                        f.write(subnet + '\n')
-                        first_octet = subnet.split('.')
-                        try:
-                            org_subnets[first_octet].append(subnet)
-                        except KeyError:
-                            org_subnets[first_octet] = [subnet]
-            return org_subnets
-
-        except requests.exceptions.ConnectionError:
-            # Connection reset by peer
-            return
-
     def load_org_IPs(self, org):
         """
         Reads the specified org's info from slips_files/organizations_info and stores the info in the database
@@ -864,6 +879,9 @@ class Whitelist:
         org: 'google', 'facebook', 'twitter', etc...
         returns a list of this organization's subnets
         """
+        if org not in utils.supported_orgs:
+            return
+
         org_info_file = os.path.join(self.org_info_path, org)
         try:
             # Each file is named after the organization's name
@@ -897,9 +915,7 @@ class Whitelist:
 
         except (FileNotFoundError, IOError):
             # there's no slips_files/organizations_info/{org} for this org
-            org_subnets = self.get_org_ipranges_online(org)
-            if not org_subnets:
-                return
+            return
 
         # Store the IPs of this org
         __database__.set_org_info(org, json.dumps(org_subnets), 'IPs')

@@ -52,10 +52,9 @@ This detection will ignore certain IP addresses for which a connection without D
 
 DNS resolutions of well known orgs might be done using DoH, in this case, slips
 doesn't know about the DNS resolution because the resolved domain won't be in dns.log
-so we simply ignore alerts of thiss time about well known org such as (facebook, apple, google, twitter, and microsoft)
+so we simply ignore alerts of this type when connected to well known organizations. In particular Facebook, Apple, Google, Twitter, and Microsoft.
 
-Slips uses it's own lists of organizations info (IPs, IP ranges, domains, and ASNs) stored in ```slips_files/organizations_info``` to check
-whether the IP/domain of each flow belong to a known org or not.
+Slips uses it's own lists of organizations and information about them (IPs, IP ranges, domains, and ASNs). They are stored in ```slips_files/organizations_info``` and they are used to check whether the IP/domain of each flow belong to a known org or not.
 
 check [DoH section](https://stratospherelinuxips.readthedocs.io/en/develop/detection_modules.html#detect-doh) 
 of the docs for info on how slips detects DoH.
@@ -66,7 +65,7 @@ of the docs for info on how slips detects DoH.
 Slips detects successful SSH connections using 2 ways
 
 1. Using Zeek. Zeek logs successful SSH connection to ssh.log by default
-2. if all bytes sent in a SSH connection is more than 4290 bytes
+2. If all bytes sent in a SSH connection is more than 4290 bytes
 
 ## DNS resolutions without a connection
 This will detect DNS resolutions for which no further connection was done. A resolution without a usage is slightly suspicious.
@@ -92,11 +91,24 @@ For example, even though 5223/TCP isn't a well known port, Apple uses it in Appl
 
 any port that isn't in the above 2 files is considered unknown to Slips.
 
-## Data exfiltration
+Slips will detect established connections only to unknown ports.
 
-Slips generate a 'possible data exfiltration alerts when the number of uploaded files to any IP exceeds 700 MBs.
+Rejected connections (not established) are detected as 'Multiple reconnection attempts'. for more details check 
+[Multiple reconnections](https://stratospherelinuxips.readthedocs.io/en/develop/flowalerts.html#multiple-reconnection-attempts)
+below
 
-The number of MBs can be modified by editting the value of ```data_exfiltration_threshold``` in ```slips.conf``` 
+## Data Upload
+
+Slips generates 'possible data upload' alerts when the number of uploaded bytes to any IP exceeds 100 MBs over
+the timewindow period which is, by default, 1h. 
+
+See detailed explanation of timewindows
+[here](https://stratospherelinuxips.readthedocs.io/en/develop/architecture.html?highlight=timewindows#architecture).
+
+The number of MBs can be modified by changing the value of ```data_exfiltration_threshold``` in ```slips.conf``` 
+
+
+Slips also detects data upload when an IP uploads >=100MBs to any IP in 1 connections. 
 
 ## Malicious JA3 and JA3s hashes
 
@@ -119,18 +131,26 @@ Slips detects any connection to port 0 using any protocol other than 'IGMP' and 
 
 ## Multiple reconnection attempts 
 
-Multiple reconnection attempts in Slips are 5 or more not established flows (reconnections) to the same destination IP.
-
-
+Multiple reconnection attempts in Slips are 5 or more not established flows (reconnections) to 
+the same destination IP on the same destination port.
 
 ## Zeek alerts
 
 By default, Slips depends on Zeek for detecting different behaviours, for example 
-Self-signed certs, invalid certs, port-scans and address scans, and password guessing.
+Self-signed certs, invalid certs, port-scans, address scans, and password guessing.
+
+Password guessing is detected by zeek when 30 failed ssh logins happen over 30 mins.
 
 Some scans are also detected by Slips independently of Zeek, like ICMP sweeps and vertical/horizontal portscans.
-Check  []() section for more info #todo
+Check 
+[PING Sweeps](https://stratospherelinuxips.readthedocs.io/en/develop/detection_modules.html#ping-sweeps) 
+section for more info 
 
+## Password Guessing
+
+Password guessing is detected using 2 ethods in slips
+1. by Zeek engine. when 30 failed ssh logins happen over 30 mins.
+2. By slips. when 20 failed ssh logins happen over 1 tiemwindow.
 
 ## DGA
 

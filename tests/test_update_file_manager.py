@@ -15,8 +15,7 @@ def do_nothing(*args):
 def create_update_manager_instance(outputQueue):
     """Create an instance of update_manager.py
     needed by every other test in this file"""
-    config = configparser.ConfigParser()
-    update_manager = UpdateFileManager(outputQueue, config, 6380)
+    update_manager = UpdateFileManager(outputQueue, 6380)
     # override the self.print function to avoid broken pipes
     update_manager.print = do_nothing
     return update_manager
@@ -70,7 +69,7 @@ def test_check_if_update(outputQueue, database, url):
     # we call this function to set the new self.new_e_tag
     # to something different than the old modified one
     # check_if_update returns a response if we should update or false if we shouldn't update
-    is_file_updated = update_manager._UpdateFileManager__check_if_update(url)
+    is_file_updated = update_manager._UpdateFileManager__check_if_update(url, update_manager.update_period)
     assert is_file_updated != False
 
 
@@ -91,7 +90,7 @@ def test_check_if_update2(outputQueue, database, url):
     assert response != False
     old_etag = update_manager.get_e_tag(response)
     database.set_TI_file_info(url.split('/')[-1], {'e-tag': old_etag})
-    is_file_updated = update_manager._UpdateFileManager__check_if_update(url)
+    is_file_updated = update_manager._UpdateFileManager__check_if_update(url, update_manager.update_period)
     assert is_file_updated == False
 
 

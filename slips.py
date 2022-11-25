@@ -18,16 +18,16 @@
 # Contact: eldraco@gmail.com, sebastian.garcia@agents.fel.cvut.cz, stratosphere@aic.fel.cvut.cz
 
 from slips_files.common.abstracts import Module
-from slips_files.common.argparse import ArgumentParser
 from slips_files.common.slips_utils import utils
-from slips_files.core.database import __database__
-import configparser
+from slips_files.core.database.database import __database__
+from slips_files.common.config_parser import ConfigParser
 import signal
 import sys
 import redis
 import os
 import time
 import shutil
+import psutil
 from datetime import datetime
 import socket
 import warnings
@@ -39,13 +39,12 @@ import importlib
 import errno
 import subprocess
 import re
-import random
 from collections import OrderedDict
 from distutils.dir_util import copy_tree
 from daemon import Daemon
 from multiprocessing import Queue
 
-version = '0.9.3'
+version = '0.9.6'
 
 # Ignore warnings on CPU from tensorflow
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -63,40 +62,32 @@ class Main:
         # slips picks a redis port from the following range
         self.start_port = 32768
         self.end_port = 32850
+        self.conf = ConfigParser()
+        self.args = self.conf.get_args()
         # in testing mode we manually set the following params
         if not testing:
             self.pid = os.getpid()
-            self.parse_arguments()
-            # set self.config
-            self.read_conf_file()
             self.check_given_flags()
             if not self.args.stopdaemon:
                 # Check the type of input
                 self.input_type, self.input_information, self.line_type = self.check_input_type()
                 # If we need zeek (bro), test if we can run it.
-                if self.check_zeek_or_bro():
-                    self.prepare_zeek_scripts()
+                self.check_zeek_or_bro()
                 self.prepare_output_dir()
                 # this is the zeek dir slips will be using
                 self.prepare_zeek_output_dir()
+                self.twid_width = self.conf.get_tw_width()
+
 
     def prepare_zeek_output_dir(self):
         from pathlib import Path
         without_ext = Path(self.input_information).stem
-        self.zeek_folder = f'./zeek_files_{without_ext}/'
-
-
-    def read_configuration(self, config, section, name):
-        """Read the configuration file for what slips.py needs. Other processes also access the configuration"""
-        try:
-            return config.get(section, name)
-        except (
-            configparser.NoOptionError,
-            configparser.NoSectionError,
-            NameError,
-        ):
-            # There is a conf, but there is no option, or no section or no configuration file specified
-            return False
+        # do we store the zeek dir inside the output dir?
+        store_zeek_files_in_the_output_dir = self.conf.store_zeek_files_in_the_output_dir()
+        if store_zeek_files_in_the_output_dir:
+            self.zeek_folder = os.path.join(self.args.output, 'zeek_files')
+        else:
+            self.zeek_folder = f'zeek_files_{without_ext}/'
 
     def get_host_ip(self):
         """
@@ -116,7 +107,8 @@ class Main:
         """
         Store the host IP address if input type is interface
         """
-        if self.input_type != 'interface':
+        running_on_interface = '-i' in sys.argv or __database__.is_growing_zeek_dir()
+        if not running_on_interface:
             return
 
         hostIP = self.get_host_ip()
@@ -166,20 +158,20 @@ class Main:
             except Exception as ex:
                 # only try to open redi-server once.
                 if tries == 2:
-                    print('[Main] Problem starting redis cache database. Stopping')
+                    print(f'[Main] Problem starting redis cache database. \n{ex}\nStopping')
                     self.terminate_slips()
                     return False
 
                 print('[Main] Starting redis cache database..')
                 os.system(
-                    f'redis-server --daemonize yes  > /dev/null 2>&1'
+                    f'redis-server redis.conf --daemonize yes  > /dev/null 2>&1'
                 )
                 # give the server time to start
                 time.sleep(1)
                 tries += 1
 
 
-    def generate_random_redis_port(self):
+    def get_random_redis_port(self):
         """
         Keeps trying to connect to random generated ports until we're connected.
         returns the used port
@@ -244,11 +236,13 @@ class Main:
 
     def terminate_slips(self):
         """
-        Do all necessary stuff to stop process any clear any files.
+        Shutdown slips, is called when stopping slips before
+        starting all modules. for example using -cb
         """
         if self.mode == 'daemonized':
             self.daemon.stop()
         sys.exit(-1)
+
 
     def get_modules(self, to_ignore):
         """
@@ -313,7 +307,7 @@ class Main:
         return plugins, failed_to_load_modules
 
     def load_modules(self):
-        to_ignore = self.get_disabled_modules()
+        to_ignore = self.conf.get_disabled_modules(self.input_type)
         # Import all the modules
         modules_to_call = self.get_modules(to_ignore)[0]
         for module_name in modules_to_call:
@@ -321,28 +315,26 @@ class Main:
                 continue
 
             module_class = modules_to_call[module_name]['obj']
-            if 'p2ptrust' == module_name:
-                ModuleProcess = module_class(
+            if 'P2P Trust' == module_name:
+                module = module_class(
                     self.outputqueue,
-                    self.config,
                     self.redis_port,
                     output_dir=self.args.output
                 )
             else:
-                ModuleProcess = module_class(
+                module = module_class(
                     self.outputqueue,
-                    self.config,
                     self.redis_port
                 )
-            ModuleProcess.start()
+            module.start()
             __database__.store_process_PID(
-                module_name, int(ModuleProcess.pid)
+                module_name, int(module.pid)
             )
             description = modules_to_call[module_name]['description']
             self.print(
-                f'\t\tStarting the module {module_name} '
+                f'\t\tStarting the module {self.green(module_name)} '
                 f'({description}) '
-                f'[PID {ModuleProcess.pid}]', 1, 0
+                f'[PID {self.green(module.pid)}]', 1, 0
                 )
         # give outputprocess time to print all the started modules
         time.sleep(0.5)
@@ -353,11 +345,10 @@ class Main:
         """
         Detailed logs are the ones created by logsProcess
         """
-        do_logs = self.read_configuration(
-            self.config, 'parameters', 'create_log_files'
-        )
+
+        do_logs = self.conf.create_log_files()
         # if -l is provided or create_log_files is yes then we will create log files
-        if self.args.createlogfiles or do_logs == 'yes':
+        if self.args.createlogfiles or do_logs:
             # Create a folder for logs
             logs_dir = self.create_folder_for_logs()
             # Create the logsfile thread if by parameter we were told,
@@ -368,66 +359,22 @@ class Main:
                 self.outputqueue,
                 self.args.verbose,
                 self.args.debug,
-                self.config,
                 logs_dir,
                 self.redis_port
             )
             logs_process.start()
             self.print(
-                f'Started logsfiles thread '
-                f'[PID {logs_process.pid}]', 1, 0
+                f'Started {self.green("Logs Process")} '
+                f'[PID {self.green(logs_process.pid)}]', 1, 0
             )
             __database__.store_process_PID(
-                'logsProcess', int(logs_process.pid)
+                'Logs', int(logs_process.pid)
             )
         else:
             # If self.args.nologfiles is False, then we don't want log files,
             # independently of what the conf says.
             logs_dir = False
 
-    def prepare_zeek_scripts(self):
-        """
-        Adds local network to slips-conf.zeek
-        """
-
-        # get home network from slips.conf
-        try:
-            home_network = self.config.get('parameters', 'home_network')
-        except (
-            configparser.NoOptionError,
-            configparser.NoSectionError,
-            NameError,
-        ):
-            # There is a conf, but there is no option, or no section or no configuration file specified
-            home_network = utils.home_network_ranges
-
-        zeek_scripts_dir = f'{os.getcwd()}/zeek-scripts'
-        # add local sites if not there
-        is_local_nets_defined = False
-        with open(f'{zeek_scripts_dir}/slips-conf.zeek', 'r') as slips_conf:
-            if 'local_nets' in slips_conf.read():
-                is_local_nets_defined = True
-
-        if not is_local_nets_defined:
-            with open(
-                    f'{zeek_scripts_dir}/slips-conf.zeek', 'a'
-            ) as slips_conf:
-                # update home network
-                slips_conf.write(
-                    '\nredef Site::local_nets += { ' + home_network + ' };\n'
-                )
-
-        # # load all scripts in zeek-script dir
-        # with open(zeek_scripts_dir + '/__load__.zeek','r') as f:
-        #     loaded_scripts = f.read()
-        # with open(zeek_scripts_dir + '/__load__.zeek','a') as f:
-        #     for file_name in os.listdir(zeek_scripts_dir):
-        #         # ignore the load file
-        #         if file_name == '__load__.zeek':
-        #             continue
-        #         if file_name not in loaded_scripts:
-        #             # found a file in the dir that isn't in __load__.zeek, add it
-        #             f.write(f'\n@load ./{file_name}')
 
     def start_gui_process(self):
         # Get the type of output from the parameters
@@ -435,37 +382,40 @@ class Main:
         if self.args.gui:
             # Create the curses thread
             guiProcessQueue = Queue()
-            guiProcessThread = GuiProcess(
+            guiProcess = GuiProcess(
                 guiProcessQueue, self.outputqueue, self.args.verbose,
-                self.args.debug, self.config
+                self.args.debug
             )
-            guiProcessThread.start()
+            __database__.store_process_PID(
+                'GUI',
+                int(guiProcess.pid)
+            )
+            guiProcess.start()
             self.print('quiet')
 
 
     def close_all_ports(self):
         """
-        Closes all the redis ports
+        Closes all the redis ports  in logfile and in slips supported range of ports
         """
+        if not hasattr(self, 'open_servers_PIDs'):
+            self.get_open_redis_servers()
 
         # close all ports in logfile
-        failed_to_close = 0
         for pid in self.open_servers_PIDs:
-            if self.flush_redis_server(pid=pid) and self.kill_redis_server(pid):
-                port = self.open_servers_PIDs[pid]
-                # self.remove_server_from_log(port)
-            else:
-                failed_to_close += 1
-        killed_servers: int = len(self.open_servers_PIDs.keys()) - failed_to_close
-        # print(f'Successfully closed {killed_servers} redis servers.')
+            self.flush_redis_server(pid=pid)
+            self.kill_redis_server(pid)
 
 
         # closes all the ports in slips supported range of ports
-        for port in range(self.start_port, self.end_port + 1):
+        slips_supported_range = [port for port in range(self.start_port, self.end_port + 1)]
+        slips_supported_range.append(6379)
+        for port in slips_supported_range:
             pid = self.get_pid_of_redis_server(port)
             if pid:
                 self.flush_redis_server(pid=pid)
                 self.kill_redis_server(pid)
+
 
         # print(f"Successfully closed all redis servers on ports {self.start_port} to {self.end_port}")
         print(f"Successfully closed all open redis servers")
@@ -492,7 +442,7 @@ class Main:
 
     def update_local_TI_files(self):
         from modules.update_manager.update_file_manager import UpdateFileManager
-        update_manager = UpdateFileManager(self.outputqueue, self.config, self.redis_port)
+        update_manager = UpdateFileManager(self.outputqueue, self.redis_port)
         update_manager.update_ports_info()
         update_manager.update_org_files()
 
@@ -501,6 +451,9 @@ class Main:
         """
         Create a metadata dir output/metadata/ that has a copy of slips.conf, whitelist.conf, current commit and date
         """
+        if not self.enable_metadata:
+            return
+
         metadata_dir = os.path.join(self.args.output, 'metadata')
         try:
             os.mkdir(metadata_dir)
@@ -509,10 +462,11 @@ class Main:
             pass
 
         # Add a copy of slips.conf
-        config_file = self.args.config or 'slips.conf'
+        config_file = self.args.config or 'config/slips.conf'
         shutil.copy(config_file, metadata_dir)
+
         # Add a copy of whitelist.conf
-        whitelist = self.config.get('parameters', 'whitelist_path')
+        whitelist = self.conf.whitelist_path()
         shutil.copy(whitelist, metadata_dir)
 
         branch_info = utils.get_branch_info()
@@ -520,7 +474,9 @@ class Main:
         if branch_info != False:
             # it's false when we're in docker because there's no .git/ there
             commit, branch = branch_info[0], branch_info[1]
+
         now = datetime.now()
+        now = utils.convert_format(now, utils.alerts_format)
 
         self.info_path = os.path.join(metadata_dir, 'info.txt')
         with open(self.info_path, 'w') as f:
@@ -534,160 +490,300 @@ class Main:
         print(f'[Main] Metadata added to {metadata_dir}')
         return self.info_path
 
-    def stop_core_processes(self):
+    def kill(self, module_name, INT=False):
+        sig = signal.SIGINT if INT else signal.SIGKILL
         try:
-            os.kill(int(self.PIDs['InputProcess']), signal.SIGKILL)
-            self.PIDs.pop('InputProcess')
-        except KeyError:
+            pid = int(self.PIDs[module_name])
+            os.kill(pid, sig)
+        except (KeyError, ProcessLookupError):
+            # process hasn't started yet
             pass
 
+    def kill_all(self, PIDs):
+        for module in PIDs:
+            if module not in self.PIDs:
+                # modules the are last to kill aren't always started and there in self.PIDs
+                # ignore them
+                continue
+
+            self.kill(module)
+            self.print_stopped_module(module)
+
+    def stop_core_processes(self):
+        self.kill('Input')
+
         if self.mode == 'daemonized':
-            # when using -D,we kill the processes because
+            # when using -D, we kill the processes because
             # the queues are not there yet to send stop msgs
-            for process in ('OutputProcess',
-                            'ProfilerProcess',
-                            'logsProcess'): #'EvidenceProcess',
-                try:
-                    os.kill(int(self.PIDs[process]), signal.SIGINT)
-                except KeyError:
-                    # logsprocess isn't started yet
-                    pass
+            for process in (
+                        'ProfilerProcess',
+                        'logsProcess',
+                        'OutputProcess'
+
+            ):
+                self.kill(process, INT=True)
+
         else:
             # Send manual stops to the processes using queues
             stop_msg = 'stop_process'
-            self.outputqueue.put(stop_msg)
             self.profilerProcessQueue.put(stop_msg)
-            # self.evidenceProcessQueue.put(stop_msg)
+            self.outputqueue.put(stop_msg)
             if hasattr(self, 'logsProcessQueue'):
                 self.logsProcessQueue.put(stop_msg)
 
 
+    def save_the_db(self):
+        # save the db to the output dir of this analysis
+        # backups_dir = os.path.join(os.getcwd(), 'redis_backups/')
+        # try:
+        #     os.mkdir(backups_dir)
+        # except FileExistsError:
+        #     pass
+        backups_dir = self.args.output
+        # The name of the interface/pcap/nfdump/binetflow used is in self.input_information
+        # if the input is a zeek dir, remove the / at the end
+        if self.input_information.endswith('/'):
+            self.input_information = self.input_information[:-1]
+        # We need to separate it from the path
+        self.input_information = os.path.basename(self.input_information)
+        # Remove the extension from the filename
+        try:
+            self.input_information = self.input_information[
+                : self.input_information.index('.')
+            ]
+        except ValueError:
+            # it's a zeek dir
+            pass
+        # Give the exact path to save(), this is where our saved .rdb backup will be
+        rdb_filepath = os.path.join(backups_dir, self.input_information)
+        __database__.save(rdb_filepath)
+        # info will be lost only if you're out of space and redis can't write to dump.rdb, otherwise you're fine
+        print(
+            '[Main] [Warning] stop-writes-on-bgsave-error is set to no, information may be lost in the redis backup file.'
+        )
+
+    def store_zeek_dir_copy(self):
+        store_a_copy_of_zeek_files = self.conf.store_a_copy_of_zeek_files()
+        was_running_zeek = self.input_type in ('pcap', 'interface') or __database__.is_growing_zeek_dir()
+        if store_a_copy_of_zeek_files and was_running_zeek:
+            # this is where the copy will be stored
+            dest_zeek_dir = os.path.join(self.args.output, 'zeek_files')
+            copy_tree(self.zeek_folder, dest_zeek_dir)
+            print(
+                f'[Main] Stored a copy of zeek files to {dest_zeek_dir}'
+            )
+
+    def delete_zeek_files(self):
+        delete = self.conf.delete_zeek_files()
+        if delete:
+            shutil.rmtree(self.zeek_folder)
+
+    def green(self, txt):
+        """
+        returns the text in green
+        """
+        GREEN_s = '\033[1;32;40m'
+        GREEN_e = '\033[00m'
+        return f'{GREEN_s}{txt}{GREEN_e}'
+
+    def print_stopped_module(self, module):
+        self.PIDs.pop(module, None)
+        # all text printed in green should be wrapped in the following
+
+        modules_left = len(list(self.PIDs.keys()))
+        # to vertically align them when printing
+        module += ' ' * (20 - len(module))
+        print(
+            f'\t{self.green(module)} \tStopped. '
+            f'{self.green(modules_left)} left.'
+        )
+
+    def get_already_stopped_modules(self):
+        already_stopped_modules = []
+        for module, pid in self.PIDs.items():
+            try:
+                # signal 0 is used to check if the pid exists
+                os.kill(int(pid), 0)
+            except ProcessLookupError:
+                # pid doesn't exist because module already stopped
+                # to be able to remove it's pid from the dict
+                already_stopped_modules.append(module)
+        return already_stopped_modules
+
+    def warn_about_pending_modules(self, finished_modules):
+        # exclude the module that are already stopped from the pending modules
+        pending_modules = [
+            module
+            for module in list(self.PIDs.keys())
+            if module not in finished_modules
+        ]
+        if not len(pending_modules):
+            return
+        print(
+            f'\n[Main] The following modules are busy working on your data.'
+            f'\n\n{pending_modules}\n\n'
+            'You can wait for them to finish, or you can '
+            'press CTRL-C again to force-kill.\n'
+        )
+        return True
+
+    def set_analysis_end_date(self):
+        """
+        Add the analysis end date to the metadata file and
+        the db for the web inerface to display
+        """
+        self.enable_metadata = self.conf.enable_metadata()
+        end_date = utils.convert_format(datetime.now(), utils.alerts_format)
+        __database__.set_input_metadata({'analysis_end': end_date})
+        if self.enable_metadata:
+            # add slips end date in the metadata dir
+            try:
+                with open(self.info_path, 'a') as f:
+                    f.write(f'Slips end date: {end_date}\n')
+            except (NameError, AttributeError):
+                pass
+        return end_date
+
+    def should_kill_all_modules(self, function_start_time, wait_for_modules_to_finish) -> bool:
+        """
+        checks if x minutes has passed since the start of the function
+        :param wait_for_modules_to_finish: time in mins to wait before force killing all modules
+                                            defined by wait_for_modules_to_finish in slips.conf
+        """
+        now = datetime.now()
+        diff = utils.get_time_diff(function_start_time, now, return_type='minutes')
+        return True if diff >= wait_for_modules_to_finish else False
+
 
     def shutdown_gracefully(self):
         """
-        Wait for all modules to confirm that they're done processing and then shutdown
+        Wait for all modules to confirm that they're done processing
+        or kill them after 15 mins
         """
-
+        # 15 mins from this time, all modules should be killed
+        function_start_time = datetime.now()
         try:
             if not self.args.stopdaemon:
                 print('\n' + '-' * 27)
             print('Stopping Slips')
 
+            wait_for_modules_to_finish  = self.conf.wait_for_modules_to_finish()
+            # close all tws
+            __database__.check_TW_to_close(close_all=True)
+
             # set analysis end date
-            now = utils.convert_format(datetime.now(), utils.alerts_format)
-            __database__.set_input_metadata({'analysis_end': now})
-            # add slips end date in the metadata dir
-            try:
-                if 'yes' in self.enable_metadata.lower():
-                    with open(self.info_path, 'a') as f:
-                        f.write(f'Slips end date: {now}\n')
-            except (NameError, AttributeError):
-                # slips is shut down before enable_metadata is read from slips.conf
-                pass
+            end_date = self.set_analysis_end_date()
+
+            start_time = __database__.get_slips_start_time()
+            analysis_time = utils.get_time_diff(start_time, end_date, return_type='minutes')
+            print(f'[Main] Analysis finished in {analysis_time:.2f} minutes')
 
             # Stop the modules that are subscribed to channels
             __database__.publish_stop()
+
             finished_modules = []
+
             # get dict of PIDs spawned by slips
             self.PIDs = __database__.get_PIDs()
 
             # we don't want to kill this process
-            try:
-                self.PIDs.pop('slips.py')
-                self.PIDs.pop('EvidenceProcess')
-            except KeyError:
-                pass
-            slips_processes = len(list(self.PIDs.keys()))
+            self.PIDs.pop('slips.py', None)
+
+            if self.mode == 'daemonized':
+                profilesLen = __database__.getProfilesLen()
+                self.daemon.print(f'Total analyzed IPs: {profilesLen}.')
+
+
+            modules_to_be_killed_last = {
+                'EvidenceProcess',
+                'Blocking',
+                'Exporting Alerts',
+            }
 
             self.stop_core_processes()
-
             # only print that modules are still running once
             warning_printed = False
 
             # timeout variable so we don't loop forever
-            # give slips enough time to close all modules - make sure all modules aren't considered 'busy' when slips stops
+            # give slips enough time to close all modules - make sure
+            # all modules aren't considered 'busy' when slips stops
             max_loops = 430
+
             # loop until all loaded modules are finished
+            # in the case of -S, slips doesn't even start the modules,
+            # so they don't publish in finished_modules. we don't need to wait for them we have to kill them
             if not self.args.stopdaemon:
-                # in the case of -S, slips doesn't even start the modules,
-                # so they don't publish in finished_modules. we don't need to wait for them we have to kill them
+                #  modules_to_be_killed_last are ignored when they publish a msg in finished modules channel,
+                # we will kill them aletr, so we shouldn't be looping and waiting for them to get outta the loop
+                slips_processes = len(list(self.PIDs.keys())) - len(modules_to_be_killed_last)
+
                 try:
                     while (
-                        len(finished_modules) < slips_processes and max_loops != 0
+                        len(finished_modules) < slips_processes  and max_loops != 0
                     ):
                         # print(f"Modules not finished yet {set(loaded_modules) - set(finished_modules)}")
                         try:
                             message = self.c1.get_message(timeout=0.00000001)
                         except NameError:
-                            # Sometimes the c1 variable does not exist yet. So just force the shutdown
-                            message = {
-                                'data': 'dummy_value_not_stopprocess',
-                                'channel': 'finished_modules',
-                            }
-
-                        if message and message['data'] == 'stop_process':
                             continue
+
+                        if message and message['data'] in ('stop_process', 'stop_slips'):
+                            continue
+
                         if utils.is_msg_intended_for(message, 'finished_modules'):
                             # all modules must reply with their names in this channel after
                             # receiving the stop_process msg
                             # to confirm that all processing is done and we can safely exit now
                             module_name = message['data']
 
+                            if module_name in modules_to_be_killed_last:
+                                # we should kill these modules the very last, or else we'll miss evidence generated
+                                # right before slips stops
+                                continue
+
+
                             if module_name not in finished_modules:
                                 finished_modules.append(module_name)
-                                try:
-                                    os.kill(int(self.PIDs[module_name]), signal.SIGKILL)
-                                except KeyError:
-                                    pass
+                                self.kill(module_name)
+                                self.print_stopped_module(module_name)
 
-                                # remove module from the list of opened pids
-                                self.PIDs.pop(module_name, None)
-
-
-                                modules_left = len(list(self.PIDs.keys()))
-                                # to vertically align them when printing
-                                module_name = module_name + ' ' * (
-                                    20 - len(module_name)
-                                )
-                                print(
-                                    f'\t\033[1;32;40m{module_name}\033[00m \tStopped. \033[1;32;40m{modules_left}\033[00m left.'
-                                )
-                        max_loops -= 1
-                        # after reaching the max_loops and before killing the modules that aren't finished,
-                        # make sure we're not in the middle of processing
-                        if len(self.PIDs) > 0 and max_loops < 2:
-                            if not warning_printed:
                                 # some modules publish in finished_modules channel before slips.py starts listening,
                                 # but they finished gracefully.
                                 # remove already stopped modules from PIDs dict
-                                for module, pid in self.PIDs.items():
-                                    try:
-                                        # signal 0 is used to check if the pid exists
-                                        os.kill(int(pid), 0)
-                                    except ProcessLookupError:
-                                        # pid doesn't exist because module already stopped
-                                        finished_modules.append(module)
+                                for module in self.get_already_stopped_modules():
+                                    finished_modules.append(module)
+                                    self.print_stopped_module(module)
 
-                                # exclude the module that are already stopped from the pending modules
-                                pending_modules = [
-                                    module
-                                    for module in list(self.PIDs.keys())
-                                    if module not in finished_modules
-                                ]
-                                if len(pending_modules) > 0:
+                        max_loops -= 1
+                        # after reaching the max_loops and before killing the modules that aren't finished,
+                        # make sure we're not processing
+                        # the logical flow is self.pids should be empty by now as all modules
+                        # are closed, the only ones left are the ones we want to kill last
+                        if len(self.PIDs) > len(modules_to_be_killed_last) and max_loops < 2:
+                            if not warning_printed and self.warn_about_pending_modules(finished_modules):
+                                if 'Update Manager' not in finished_modules:
                                     print(
-                                        f'\n[Main] The following modules are busy working on your data.'
-                                        f'\n\n{pending_modules}\n\n'
-                                        'You can wait for them to finish, or you can press CTRL-C again to force-kill.\n'
+                                        f"[Main] Update Manager may take several minutes "
+                                        f"to finish updating 45+ TI files."
                                     )
-                                    warning_printed = True
-                            # -P flag is only used in integration tests,
+                                warning_printed = True
+
+                            # -t flag is only used in integration tests,
                             # so we don't care about the modules finishing their job when testing
                             # instead, kill them
-                            if not self.args.port:
-                                # delay killing unstopped modules
-                                max_loops += 1
-                                continue
+                            if self.args.testing:
+                                break
+
+                            # delay killing unstopped modules until all of them
+                            # are done processing
+                            max_loops += 1
+
+                            # checks if 15 minutes has passed since the start of the function
+                            if self.should_kill_all_modules(function_start_time, wait_for_modules_to_finish):
+                                print(f"Killing modules that took more than "
+                                      f"{wait_for_modules_to_finish} mins to finish.")
+                                break
+
                 except KeyboardInterrupt:
                     # either the user wants to kill the remaining modules (pressed ctrl +c again)
                     # or slips was stuck looping for too long that the os sent an automatic sigint to kill slips
@@ -696,108 +792,27 @@ class Main:
 
             # modules that aren't subscribed to any channel will always be killed and not stopped
             # comes here if the user pressed ctrl+c again
-            for unstopped_proc, pid in self.PIDs.items():
-                unstopped_proc = unstopped_proc + ' ' * (
-                    20 - len(unstopped_proc)
-                )
-                try:
-                    os.kill(int(pid), 9)
-                    print(f'\t\033[1;32;40m{unstopped_proc}\033[00m \tKilled.')
-                except ProcessLookupError:
-                    print(
-                        f'\t\033[1;32;40m{unstopped_proc}\033[00m \tAlready stopped.'
-                    )
-            # evidence process should be the last process to exit, so it can print detections of the
-            # modules that are still processing
-            try:
-                os.kill(int(self.PIDs['EvidenceProcess']), signal.SIGINT)
-            except KeyError:
-                pass
+            self.kill_all(self.PIDs.copy())
+            self.kill_all(modules_to_be_killed_last)
 
             # save redis database if '-s' is specified
             if self.args.save:
-                # Create a new dir to store backups
-                backups_dir = os.path.join(os.getcwd(), 'redis_backups/')
-                try:
-                    os.mkdir(backups_dir)
-                except FileExistsError:
-                    pass
-                # The name of the interface/pcap/nfdump/binetflow used is in self.input_information
-                # if the input is a zeek dir, remove the / at the end
-                if self.input_information.endswith('/'):
-                    self.input_information = self.input_information[:-1]
-                # We need to separate it from the path
-                self.input_information = os.path.basename(self.input_information)
-                # Remove the extension from the filename
-                try:
-                    self.input_information = self.input_information[
-                        : self.input_information.index('.')
-                    ]
-                except ValueError:
-                    # it's a zeek dir
-                    pass
-                # Give the exact path to save(), this is where our saved .rdb backup will be
-                rdb_filepath = os.path.join(backups_dir, self.input_information)
-                __database__.save(rdb_filepath)
-                # info will be lost only if you're out of space and redis can't write to dump.rdb, otherwise you're fine
-                print(
-                    '[Main] [Warning] stop-writes-on-bgsave-error is set to no, information may be lost in the redis backup file.'
-                )
+                self.save_the_db()
 
-            # make sure that redis isn't saving snapshots whether -s is given or not
-            __database__.disable_redis_snapshots()
-
-            # if store_a_copy_of_zeek_files is set to yes in slips.conf, copy the whole zeek_files dir to the output dir
-            try:
-                store_a_copy_of_zeek_files = self.config.get(
-                    'parameters', 'store_a_copy_of_zeek_files'
-                )
-                store_a_copy_of_zeek_files = (
-                    False
-                    if 'no' in store_a_copy_of_zeek_files.lower()
-                    else True
-                )
-            except (
-                configparser.NoOptionError,
-                configparser.NoSectionError,
-                NameError,
-            ):
-                # There is a conf, but there is no option, or no section or no configuration file specified
-                store_a_copy_of_zeek_files = False
-            if store_a_copy_of_zeek_files and self.input_type in ('pcap', 'interface'):
-                # this is where the copy will be stored
-                dest_zeek_dir = os.path.join(self.args.output, 'zeek_files')
-                copy_tree(self.zeek_folder, dest_zeek_dir)
-                print(
-                    f'[Main] Stored a copy of zeek files to {dest_zeek_dir}'
-                )
+            # if store_a_copy_of_zeek_files is set to yes in slips.conf,
+            # copy the whole zeek_files dir to the output dir
+            self.store_zeek_dir_copy()
 
             # if delete_zeek_files is set to yes in slips.conf,
-            # delete the whole zeek_files
-            try:
-                delete_zeek_files = self.config.get(
-                    'parameters', 'delete_zeek_files'
-                )
-                delete_zeek_files = (
-                    False if 'no' in delete_zeek_files.lower() else True
-                )
-            except (
-                configparser.NoOptionError,
-                configparser.NoSectionError,
-                NameError,
-            ):
-                # There is a conf, but there is no option, or no section or no configuration file specified
-                delete_zeek_files = True
-
-            if delete_zeek_files:
-                shutil.rmtree('zeek_files')
+            # delete zeek_files/ dir
+            self.delete_zeek_files()
 
             if self.mode == 'daemonized':
-                profilesLen = str(__database__.getProfilesLen())
-                print(f'Total Number of Profiles in DB: {profilesLen}.')
-                self.daemon.stop()
+                # if slips finished normally without stopping the daemon with -S
+                # then we need to delete the pidfile
+                self.daemon.delete_pidfile()
+
             os._exit(-1)
-            return True
         except KeyboardInterrupt:
             return False
 
@@ -829,7 +844,9 @@ class Main:
         Returns a dict {counter: (used_port,pid) }
         """
         open_servers = {}
-        print(f"[0] Close all servers")
+        to_print = f"Choose which one to kill [0,1,2 etc..]\n" \
+                   f"[0] Close all Redis servers\n"
+        there_are_ports_to_print = False
         try:
             with open(self.running_logfile, 'r') as f:
                 line_number = 0
@@ -844,12 +861,19 @@ class Main:
                     line_number += 1
                     line = line.split(',')
                     file, port, pid = line[1], line[2], line[3]
-                    print(f"[{line_number}] {file} - port {port}")
+                    there_are_ports_to_print = True
+                    to_print += f"[{line_number}] {file} - port {port}\n"
                     open_servers[line_number] = (port, pid)
-                return open_servers
         except FileNotFoundError:
             print(f"{self.running_logfile} is not found. Can't get open redis servers. Stopping.")
             return False
+
+        if there_are_ports_to_print:
+            print(to_print)
+        else:
+            print(f"No open redis servers in {self.running_logfile}")
+
+        return open_servers
 
 
     def get_port_of_redis_server(self, pid: str):
@@ -938,20 +962,18 @@ class Main:
             return False
         return True
 
-    def remove_old_logline(self):
+    def remove_old_logline(self, redis_port):
         """
-        The only line with 6379 should be the last line, remove all the ones above
+        This function should be called after adding a new duplicate line with redis_port
+        The only line with redis_port will be the last line, remove all the ones above
         """
-        redis_port = str(6379)
+        redis_port = str(redis_port)
         tmpfile = 'tmp_running_slips_log.txt'
         with open(self.running_logfile, 'r') as logfile:
             with open(tmpfile, 'w') as tmp:
                 all_lines = logfile.read().splitlines()
-                # the only one that should have 6379
-                last_line = all_lines[-1]
                 # we want to delete the old log line containing this port
                 # but leave the new one (the last one)
-
                 for line in all_lines[:-1]:
                     if redis_port not in line:
                         tmp.write(f'{line}\n')
@@ -986,13 +1008,8 @@ class Main:
             # fill the dict
             self.get_open_redis_servers()
 
-        # if len(self.open_servers_PIDs) == 0:
-        #     print('No unused open servers to kill.')
-        #     sys.exit(-1)
-        #     return
         try:
-            print(f"Choose which one to kill [0,1,2 etc..]\n")
-            # open_servers {1: (port,pid),...}}
+            # open_servers {counter: (port,pid),...}}
             open_servers:dict = self.print_open_redis_servers()
             if not open_servers:
                 self.terminate_slips()
@@ -1002,7 +1019,8 @@ class Main:
             if server_to_close == '0':
                 self.close_all_ports()
 
-            if len(open_servers) > 0:
+            elif len(open_servers) > 0:
+                # close the given server number
                 try:
                     pid = open_servers[int(server_to_close)][1]
                     port = open_servers[int(server_to_close)][0]
@@ -1015,6 +1033,7 @@ class Main:
                     self.remove_server_from_log(port)
                 except (KeyError, ValueError):
                     print(f"Invalid input {server_to_close}")
+
         except KeyboardInterrupt:
             pass
         self.terminate_slips()
@@ -1063,206 +1082,36 @@ class Main:
 
         # print(f'[Main] Storing Slips logs in {self.args.output}')
 
-    def parse_arguments(self):
-        # Parse the parameters
-        slips_conf_path = os.path.join(os.getcwd() ,'slips.conf')
-        parser = ArgumentParser(
-            usage='./slips.py -c <configfile> [options] [file]', add_help=False
-        )
-        parser.add_argument(
-            '-c',
-            '--config',
-            metavar='<configfile>',
-            action='store',
-            required=False,
-            default=slips_conf_path,
-            help='Path to the Slips config file.',
-        )
-        parser.add_argument(
-            '-v',
-            '--verbose',
-            metavar='<verbositylevel>',
-            action='store',
-            required=False,
-            type=int,
-            help='Verbosity level. This logs more info about slips.',
-        )
-        parser.add_argument(
-            '-e',
-            '--debug',
-            metavar='<debuglevel>',
-            action='store',
-            required=False,
-            type=int,
-            help='Debugging level. This shows more detailed errors.',
-        )
-        parser.add_argument(
-            '-f',
-            '--filepath',
-            metavar='<file>',
-            action='store',
-            required=False,
-            help='read a Zeek folder, Argus binetflow, pcapfile or nfdump.',
-        )
-        parser.add_argument(
-            '-i',
-            '--interface',
-            metavar='<interface>',
-            action='store',
-            required=False,
-            help='Read packets from an interface.',
-        )
-        parser.add_argument(
-            '-l',
-            '--createlogfiles',
-            action='store_true',
-            required=False,
-            help='Create log files with all the traffic info and detections.',
-        )
-        parser.add_argument(
-            '-F',
-            '--pcapfilter',
-            action='store',
-            required=False,
-            type=str,
-            help='packet filter for Zeek. BPF style.',
-        )
-        parser.add_argument(
-            '-G',
-            '--gui',
-            help='Use the GUI interface.',
-            required=False,
-            default=False,
-            action='store_true',
-        )
-        parser.add_argument(
-            '-cc',
-            '--clearcache',
-            action='store_true',
-            required=False,
-            help='Clear the cache database.',
-        )
-        parser.add_argument(
-            '-p',
-            '--blocking',
-            help='Allow Slips to block malicious IPs. Requires root access. Supported only on Linux.',
-            required=False,
-            default=False,
-            action='store_true',
-        )
-        parser.add_argument(
-            '-cb',
-            '--clearblocking',
-            help='Flush and delete slipsBlocking iptables chain',
-            required=False,
-            default=False,
-            action='store_true',
-        )
-        parser.add_argument(
-            '-o',
-            '--output',
-            action='store',
-            required=False,
-            default=self.alerts_default_path,
-            help='Store alerts.json and alerts.txt in the provided folder.',
-        )
-        parser.add_argument(
-            '-s',
-            '--save',
-            action='store_true',
-            required=False,
-            help='To Save redis db to disk. Requires root access.',
-        )
-        parser.add_argument(
-            '-d',
-            '--db',
-            action='store',
-            required=False,
-            help='To read a redis (rdb) saved file. Requires root access.',
-        )
-        parser.add_argument(
-            '-D',
-            '--daemon',
-            required=False,
-            default=False,
-            action='store_true',
-            help='run slips in daemon mode, not interactive',
-        )
-        parser.add_argument(
-            '-S',
-            '--stopdaemon',
-            required=False,
-            default=False,
-            action='store_true',
-            help='Stop slips daemon',
-        )
-        parser.add_argument(
-            '-k',
-            '--killall',
-            action='store_true',
-            required=False,
-            help='Kill all unused redis servers',
-        )
-        parser.add_argument(
-            '-m',
-            '--multiinstance',
-            action='store_true',
-            required=False,
-            help='Run multiple instances of slips, don\'t overwrite the old one',
-        )
-        parser.add_argument(
-            '-P',
-            '--port',
-            action='store',
-            required=False,
-            help='The redis-server port to use',
-        )
-        parser.add_argument(
-            '-V',
-            '--version',
-            action='store_true',
-            required=False,
-            help='Print Slips Version',
-        )
-        parser.add_argument(
-            '-h', '--help', action='help', help='command line help'
-        )
-        self.args = parser.parse_args()
-
-    def read_conf_file(self):
-        # don't use '%' for interpolation.
-        self.config = configparser.ConfigParser(interpolation=None)
-        try:
-            with open(self.args.config) as source:
-                self.config.read_file(source)
-        except (IOError, TypeError):
-            pass
-
-        return self.config
 
     def log_redis_server_PID(self, redis_port, redis_pid):
         now = utils.convert_format(datetime.now(), utils.alerts_format)
+        try:
+            # used in case we need to remove the line using 6379 from running logfile
+            with open(self.running_logfile, 'a') as f:
+                # add the header lines if the file is newly created
+                if f.tell() == 0:
+                    f.write(
+                        '# This file contains a list of used redis ports.\n'
+                        '# Once a server is killed, it will be removed from this file.\n'
+                        'Date, File or interface, Used port, Server PID,'
+                        ' Output Zeek Dir, Logs Dir, Slips PID, Is Daemon, Save the DB\n'
+                    )
 
-        # used in case we need to remove the line using 6379 from running logfile
-        with open(self.running_logfile, 'a') as f:
-            # add the header lines if the file is newly created
-            if f.tell() == 0:
                 f.write(
-                    '# This file contains a list of used redis ports.\n'
-                    '# Once a server is killed, it will be removed from this file.\n'
-                    'Date, File or interface, Used port, Server PID,'
-                    ' Output Zeek Dir, Logs Dir, Is Daemon, Save the DB\n'
+                    f'{now},{self.input_information},{redis_port},'
+                    f'{redis_pid},{self.zeek_folder},{self.args.output},'
+                    f'{os.getpid()},'
+                    f'{bool(self.args.daemon)},{self.args.save}\n'
                 )
-
-            f.write(
-                f'{now},{self.input_information},{redis_port},'
-                f'{redis_pid},{self.zeek_folder},{self.args.output},'
-                f'{bool(self.args.daemon)},{self.args.save}\n'
-            )
+        except PermissionError:
+            # last run was by root, change the file ownership to non-root
+            os.remove(self.running_logfile)
+            open(self.running_logfile, 'w').close()
+            self.log_redis_server_PID(redis_port, redis_pid)
 
         if redis_port == 6379:
             # remove the old logline using this port
-            self.remove_old_logline()
+            self.remove_old_logline(6379)
 
     def set_mode(self, mode, daemon=''):
         """
@@ -1301,65 +1150,7 @@ class Main:
         levels = f'{verbose}{debug}'
         self.outputqueue.put(f'{levels}|{self.name}|{text}')
 
-    def get_disabled_modules(self) -> list:
-        to_ignore = self.read_configuration(
-            self.config, 'modules', 'disable'
-        )
-        use_p2p = self.read_configuration(
-            self.config, 'P2P', 'use_p2p'
-        )
 
-        if not to_ignore:
-            return []
-        # Convert string to list
-        to_ignore = (
-            to_ignore.replace('[', '')
-                .replace(']', '')
-                .replace(' ', '')
-                .split(',')
-        )
-        # Ignore exporting alerts module if export_to is empty
-        export_to = (
-            self.config.get('ExportingAlerts', 'export_to')
-                .rstrip('][')
-                .replace(' ', '')
-                .lower()
-        )
-        if (
-                'stix' not in export_to
-                and 'slack' not in export_to
-                and 'json' not in export_to
-        ):
-            to_ignore.append('exporting_alerts')
-        if (
-                not use_p2p
-                or use_p2p == 'no'
-                or not self.args.interface
-        ):
-            to_ignore.append('p2ptrust')
-
-        # ignore CESNET sharing module if send and receive are are disabled in slips.conf
-        send_to_warden = self.config.get(
-            'CESNET', 'send_alerts'
-        ).lower()
-        receive_from_warden = self.config.get(
-            'CESNET', 'receive_alerts'
-        ).lower()
-        if 'no' in send_to_warden and 'no' in receive_from_warden:
-            to_ignore.append('CESNET')
-        # don't run blocking module unless specified
-        if (
-                not self.args.clearblocking
-                and not self.args.blocking
-                or (self.args.blocking and not self.args.interface)
-        ):  # ignore module if not using interface
-            to_ignore.append('blocking')
-
-        # leak detector only works on pcap files
-        if self.input_type != 'pcap':
-            to_ignore.append('leak_detector')
-
-        return to_ignore
 
     def handle_flows_from_stdin(self, input_information):
         """
@@ -1387,26 +1178,37 @@ class Main:
         input_type = 'stdin'
         return input_type, line_type.lower()
 
+
     def load_db(self):
         self.input_type = 'database'
         # self.input_information = 'database'
-        from slips_files.core.database import __database__
-        __database__.start(self.config, 6379)
+        from slips_files.core.database.database import __database__
+        __database__.start(6379)
+
+        # this is where the db will be loaded
+        redis_port = 32850
+        # make sure the db on 32850 is flushed and ready for the new db to be loaded
+        if pid := self.get_pid_of_redis_server(redis_port):
+            self.flush_redis_server(pid=pid)
+            self.kill_redis_server(pid)
+
         if not __database__.load(self.args.db):
             print(f'Error loading the database {self.args.db}')
         else:
-            redis_port = 6379
-            self.input_information = self.args.db
-            __database__.connect_to_redis_server(redis_port)
-            __database__.enable_redis_snapshots()
-            #todo see why the dumps.rdb isn't loaded in 6379
-            redis_pid = __database__.get_redis_server_PID(self.mode, redis_port)
+            # to be able to use running_slips_info later as a non-root user,
+            # we shouldn't modify it as root
+
+            self.input_information = os.path.basename(self.args.db)
+            redis_pid = self.get_pid_of_redis_server(redis_port)
+            self.zeek_folder = '""'
             self.log_redis_server_PID(redis_port, redis_pid)
+            self.remove_old_logline(redis_port)
 
             print(
-                f'{self.args.db} loaded successfully. Run ./kalipso.sh and choose port 6379'
+                f'{self.args.db} loaded successfully.\n'
+                f'Run ./kalipso.sh and choose port {redis_port}'
             )
-            __database__.disable_redis_snapshots()
+            # __database__.disable_redis_persistence()
 
         self.terminate_slips()
 
@@ -1423,7 +1225,6 @@ class Main:
         )
         # Get command output
         cmd_result = cmd_result.stdout.decode('utf-8')
-
         if 'pcap' in cmd_result:
             input_type = 'pcap'
         elif 'dBase' in cmd_result:
@@ -1458,16 +1259,22 @@ class Main:
                 except json.decoder.JSONDecodeError:
                     # this is a tab separated file
                     # is it zeek log file or binetflow file?
-                    tabs_found = re.search(
+
+                    # zeek tab files are separated by several spaces or tabs
+                    sequential_spaces_found = re.search(
                         '\s{1,}-\s{1,}', first_line
                     )
+                    tabs_found = re.search(
+                        '\t{1,}', first_line
+                    )
+
                     if (
                             '->' in first_line
                             or 'StartTime' in first_line
                     ):
                         # tab separated files are usually binetflow tab files
                         input_type = 'binetflow-tabs'
-                    elif tabs_found:
+                    elif sequential_spaces_found or tabs_found:
                         input_type = 'zeek_log_file'
 
         return input_type
@@ -1509,9 +1316,26 @@ class Main:
 
     def check_given_flags(self):
         """
-        check the flags that don't reuiqre starting slips
-        for ex: clear db, clear blocking, killling all servers, stopping the daemon, etc.
+        check the flags that don't require starting slips
+        for ex: clear db, clear blocking, killing all servers, stopping the daemon, etc.
         """
+
+        if self.args.help:
+            self.print_version()
+            arg_parser = self.conf.get_parser(help=True)
+            arg_parser.parse_arguments()
+            arg_parser.print_help()
+            self.terminate_slips()
+
+        if self.args.interface and self.args.filepath:
+            print('Only -i or -f is allowed. Stopping slips.')
+            self.terminate_slips()
+
+
+        if (self.args.save or self.args.db) and os.getuid() != 0:
+            print('Saving and loading the database requires root privileges.')
+            self.terminate_slips()
+
         if (self.args.verbose and int(self.args.verbose) > 3) or (
             self.args.debug and int(self.args.debug) > 3
         ):
@@ -1519,14 +1343,34 @@ class Main:
             self.terminate_slips()
 
         # Check if redis server running
-        if self.check_redis_database() is False:
+        if not self.args.killall and self.check_redis_database() is False:
             print('Redis database is not running. Stopping Slips')
             self.terminate_slips()
+
+        if self.args.config and not os.path.exists(self.args.config):
+            print(f"{self.args.config} doesn't exist. Stopping Slips")
+            self.terminate_slips()
+
+        if self.args.interface:
+            interfaces = psutil.net_if_addrs().keys()
+            if self.args.interface not in interfaces:
+                print(f"{self.args.interface} is not a valid interface. Stopping Slips")
+                self.terminate_slips()
+
 
         # Clear cache if the parameter was included
         if self.args.clearcache:
             print('Deleting Cache DB in Redis.')
             self.clear_redis_cache_database()
+            self.input_information = ''
+            self.zeek_folder = ''
+            self.log_redis_server_PID(6379, self.get_pid_of_redis_server(6379))
+            self.terminate_slips()
+
+
+        # Clear cache if the parameter was included
+        if self.args.blocking and not self.args.interface:
+            print('Blocking is only allowed when running slips using an interface.')
             self.terminate_slips()
 
         # kill all open unused redis servers if the parameter was included
@@ -1538,6 +1382,17 @@ class Main:
             self.print_version()
             self.terminate_slips()
 
+        if (
+            self.args.interface
+            and self.args.blocking
+            and os.geteuid() != 0
+        ):
+            # If the user wants to blocks, we need permission to modify iptables
+            print(
+                'Run Slips with sudo to enable the blocking module.'
+            )
+            self.terminate_slips()
+
         if self.args.clearblocking:
             if os.geteuid() != 0:
                 print(
@@ -1546,39 +1401,45 @@ class Main:
                 self.terminate_slips()
             else:
                 # start only the blocking module process and the db
-                from slips_files.core.database import __database__
-                from multiprocessing import Queue
+                from slips_files.core.database.database import __database__
+                from multiprocessing import Queue, active_children
                 from modules.blocking.blocking import Module
 
-                blocking = Module(Queue(), self.config)
+                blocking = Module(Queue())
                 blocking.start()
                 blocking.delete_slipsBlocking_chain()
-                # Tell the blocking module to clear the slips chain
-                self.shutdown_gracefully()
+                # kill the blocking module manually because we can't
+                # run shutdown_gracefully here (not all modules has started)
+                for child in active_children():
+                    child.kill()
+                self.terminate_slips()
+
 
         # Check if user want to save and load a db at the same time
-        if self.args.save:
-            # make sure slips is running as root
-            if os.geteuid() != 0:
-                print(
-                    'Slips needs to be run as root to save the database. Stopping.'
-                )
-                self.terminate_slips()
-            if self.args.db:
-                print("Can't use -s and -b together")
-                self.terminate_slips()
+        if self.args.save and self.args.db:
+            print("Can't use -s and -d together")
+            self.terminate_slips()
 
     def set_input_metadata(self):
         """
         save info about name, size, analysis start date in the db
         """
         now = utils.convert_format(datetime.now(), utils.alerts_format)
+        to_ignore = self.conf.get_disabled_modules(self.input_type)
+
         info = {
             'slips_version': version,
             'name': self.input_information,
             'analysis_start': now,
-
+            'disabled_modules': json.dumps(to_ignore),
+            'output_dir': self.args.output,
+            'input_type': self.input_type,
         }
+
+        if hasattr(self, 'zeek_folder'):
+            info.update({
+                'zeek_dir': self.zeek_folder
+            })
 
         size_in_mb = '-'
         if self.args.filepath not in (False, None) and os.path.exists(self.args.filepath):
@@ -1589,25 +1450,10 @@ class Main:
         info.update({
             'size_in_MB': size_in_mb,
         })
-        # analysis end date will be set in shutdowngracefully
+        # analysis end date will be set in shutdown_gracefully
         # file(pcap,netflow, etc.) start date will be set in
         __database__.set_input_metadata(info)
 
-    def check_blocking_permissions(self):
-        """
-        Check if the user blocks on interface, does not make sense to block on files
-        """
-
-        if (
-            self.args.interface
-            and self.args.blocking
-            and os.geteuid() != 0
-        ):
-            # If the user wants to blocks,we need permission to modify iptables
-            print(
-                '[Main] Run Slips with sudo to enable the blocking module.'
-            )
-            self.shutdown_gracefully()
 
     def setup_print_levels(self):
         """
@@ -1615,41 +1461,15 @@ class Main:
         """
         # Any verbosity passed as parameter overrides the configuration. Only check its value
         if self.args.verbose == None:
-            # Read the verbosity from the config
-            try:
-                self.args.verbose = int(
-                    self.config.get('parameters', 'verbose')
-                )
-            except (
-                configparser.NoOptionError,
-                configparser.NoSectionError,
-                NameError,
-                ValueError,
-            ):
-                # There is a conf, but there is no option, or no section or no configuration file specified
-                # By default, 1
-                self.args.verbose = 1
+            self.args.verbose = self.conf.verbose()
 
         # Limit any verbosity to > 0
         if self.args.verbose < 1:
             self.args.verbose = 1
 
-        # Any debuggsity passed as parameter overrides the configuration. Only check its value
+        # Any deug passed as parameter overrides the configuration. Only check its value
         if self.args.debug == None:
-            # Read the debug from the config
-            try:
-                self.args.debug = int(
-                    self.config.get('parameters', 'debug')
-                )
-            except (
-                configparser.NoOptionError,
-                configparser.NoSectionError,
-                NameError,
-                ValueError,
-            ):
-                # There is a conf, but there is no option, or no section or no configuration file specified
-                # By default, 0
-                self.args.debug = 0
+            self.args.debug = self.conf.debug()
 
         # Limit any debuggisity to > 0
         if self.args.debug < 0:
@@ -1684,13 +1504,14 @@ class Main:
         return (current_stdout, stderr, slips_logfile)
 
     def print_version(self):
-        slips_version = f'Slips. Version {version}'
+        slips_version = f'Slips. Version {self.green(version)}'
         branch_info = utils.get_branch_info()
         if branch_info != False:
             # it's false when we're in docker because there's no .git/ there
             commit = branch_info[0]
             slips_version += f' ({commit[:8]})'
         print(slips_version)
+
 
     def start(self):
         """Main Slips Function"""
@@ -1701,7 +1522,6 @@ class Main:
             print('https://stratosphereips.org')
             print('-' * 27)
 
-            self.check_blocking_permissions()
             """
             Import modules here because if user wants to run "./slips.py --help" it should never throw error. 
             """
@@ -1717,13 +1537,12 @@ class Main:
             ##########################
             # Creation of the threads
             ##########################
-            from slips_files.core.database import __database__
 
             # get the port that is going to be used for this instance of slips
             if self.args.port:
                 self.redis_port = int(self.args.port)
             elif self.args.multiinstance:
-                self.redis_port = self.generate_random_redis_port()
+                self.redis_port = self.get_random_redis_port()
                 if not self.redis_port:
                     # all ports are unavailable
                     inp = input("Press Enter to close all ports.\n")
@@ -1732,7 +1551,6 @@ class Main:
                     self.terminate_slips()
             else:
                 self.redis_port = 6379
-
 
             # Output thread. outputprocess should be created first because it handles
             # the output of the rest of the threads.
@@ -1745,7 +1563,6 @@ class Main:
                 self.outputqueue,
                 self.args.verbose,
                 self.args.debug,
-                self.config,
                 self.redis_port,
                 stdout=current_stdout,
                 stderr=stderr,
@@ -1753,13 +1570,23 @@ class Main:
             )
             # this process starts the db
             output_process.start()
+            __database__.store_process_PID('Output', int(output_process.pid))
+
+            if self.args.growing:
+                if self.input_type != 'zeek_folder':
+                    self.print(f"Parameter -g should be using with -f <dirname> not a {self.input_type}. Ignoring -g")
+                else:
+                    self.print(f"Running on a growing zeek dir: {self.input_information}")
+                    __database__.set_growing_zeek_dir()
+
+            # log the PID of the started redis-server
+            # should be here after we're sure that the server was started
+            redis_pid = self.get_pid_of_redis_server(self.redis_port)
+            self.log_redis_server_PID(self.redis_port, redis_pid)
 
             __database__.set_slips_mode(self.mode)
-            self.set_input_metadata()
-            if self.args.save:
-                __database__.enable_redis_snapshots()
-            else:
-                __database__.disable_redis_snapshots()
+
+
 
             if self.mode == 'daemonized':
                 std_files = {
@@ -1777,14 +1604,10 @@ class Main:
 
             __database__.store_std_file(**std_files)
 
-            # log the PID of the started redis-server
-            redis_pid = __database__.get_redis_server_PID(self.mode, self.redis_port)
-            self.log_redis_server_PID(self.redis_port, redis_pid)
-            __database__.store_process_PID('OutputProcess', int(output_process.pid))
 
-            self.print(f'Using redis server on port: {self.redis_port}', 1, 0)
-            self.print(f'Started main program [PID {self.pid}]', 1, 0)
-            self.print(f'Started output thread [PID {output_process.pid}]', 1, 0)
+            self.print(f'Using redis server on port: {self.green(self.redis_port)}', 1, 0)
+            self.print(f'Started {self.green("Main")} process [PID {self.green(self.pid)}]', 1, 0)
+            self.print(f'Started {self.green("Output Process")} [PID {self.green(output_process.pid)}]', 1, 0)
             self.print('Starting modules', 0, 1)
 
 
@@ -1804,26 +1627,23 @@ class Main:
             # The signals SIGKILL and SIGSTOP cannot be caught, blocked, or ignored.
             signal.signal(signal.SIGTERM, sig_handler)
 
-
             logs_dir = self.setup_detailed_logs(LogsProcess)
-
 
             self.evidenceProcessQueue = Queue()
             evidence_process = EvidenceProcess(
                 self.evidenceProcessQueue,
                 self.outputqueue,
-                self.config,
                 self.args.output,
                 logs_dir,
                 self.redis_port,
             )
             evidence_process.start()
             self.print(
-                f'Started Evidence Process '
-                f'[PID {evidence_process.pid}]', 1, 0
+                f'Started {self.green("Evidence Process")} '
+                f'[PID {self.green(evidence_process.pid)}]', 1, 0
             )
             __database__.store_process_PID(
-                'EvidenceProcess',
+                'Evidence',
                 int(evidence_process.pid)
             )
             __database__.store_process_PID(
@@ -1837,29 +1657,24 @@ class Main:
                 self.outputqueue,
                 self.args.verbose,
                 self.args.debug,
-                self.config,
                 self.redis_port,
             )
             profiler_process.start()
             self.print(
-                f'Started Profiler Process '
-                f'[PID {profiler_process.pid}]', 1, 0
+                f'Started {self.green("Profiler Process")} '
+                f'[PID {self.green(profiler_process.pid)}]', 1, 0
             )
             __database__.store_process_PID(
-                'ProfilerProcess',
+                'Profiler',
                 int(profiler_process.pid)
             )
 
             self.c1 = __database__.subscribe('finished_modules')
-
-            # Input process
-            # Create the input process and start it
             inputProcess = InputProcess(
                 self.outputqueue,
                 self.profilerProcessQueue,
                 self.input_type,
                 self.input_information,
-                self.config,
                 self.args.pcapfilter,
                 self.zeek_bro,
                 self.zeek_folder,
@@ -1868,14 +1683,19 @@ class Main:
             )
             inputProcess.start()
             self.print(
-                f'Started input thread '
-                f'[PID {inputProcess.pid}]', 1, 0
+                f'Started {self.green("Input Process")} '
+                f'[PID {self.green(inputProcess.pid)}]', 1, 0
             )
             __database__.store_process_PID(
-                'InputProcess',
+                'Input Process',
                 int(inputProcess.pid)
             )
             self.zeek_folder = inputProcess.zeek_folder
+            self.set_input_metadata()
+
+            if self.conf.use_p2p() and not self.args.interface:
+                self.print('Warning: P2P is only supported using an interface. Disabled P2P.')
+
             # warn about unused open redis servers
             open_servers = len(self.get_open_redis_servers())
             if open_servers > 1:
@@ -1885,26 +1705,25 @@ class Main:
                     f'Run Slips with --killall to stop them.'
                 )
 
-            self.enable_metadata = self.read_configuration(
-                                                self.config,
-                                                'parameters',
-                                                'metadata_dir'
-                                                )
+            self.enable_metadata = self.conf.enable_metadata()
 
-            if 'yes' in self.enable_metadata.lower():
+            if self.enable_metadata:
                 self.info_path = self.add_metadata()
 
             hostIP = self.store_host_ip()
 
             # Check every 5 secs if we should stop slips or not
             sleep_time = 5
+
             # In each interval we check if there has been any modifications to
             # the database by any module.
             # If not, wait this amount of intervals and then stop slips.
-            # We choose 6 to wait 30 seconds.
             max_intervals_to_wait = 4
             intervals_to_wait = max_intervals_to_wait
-            slips_internal_time = 0
+
+            # Don't try to stop slips if it's capturing from an interface or a growing zeek dir
+            is_interface: bool = self.args.interface or __database__.is_growing_zeek_dir()
+
             while True:
                 message = self.c1.get_message(timeout=0.01)
                 if (
@@ -1926,75 +1745,51 @@ class Main:
                 ) = __database__.getModifiedProfilesSince(
                     slips_internal_time
                 )
-                amount_of_modified = len(modified_profiles)
+                modified_ips_in_the_last_tw = len(modified_profiles)
+
                 # Get the time of last modified timewindow and set it as a new
                 if last_modified_tw_time != 0:
                     __database__.setSlipsInternalTime(
                         last_modified_tw_time
                     )
-                # How many profiles we have?
-                profilesLen = str(__database__.getProfilesLen())
-                if self.mode != 'daemonized' and self.input_type != 'stdin':
-                    now = utils.convert_format(datetime.now(), utils.alerts_format)
+
+                if self.mode != 'daemonized':
+                    # How many profiles we have?
+                    profilesLen = str(__database__.getProfilesLen())
+
+                    now = utils.convert_format(datetime.now(), '%Y/%m/%d %H:%M:%S')
                     print(
-                        f'Total Number of Profiles in DB so '
+                        f'Total analyzed IPs so '
                         f'far: {profilesLen}. '
-                        f'Modified Profiles in the last TW: {amount_of_modified}. '
+                        f'IPs sending traffic in the last {self.twid_width}: {modified_ips_in_the_last_tw}. '
                         f'({now})',
                         end='\r',
                     )
 
-                # Check if we need to close some TW
+                # Check if we need to close any TWs
                 __database__.check_TW_to_close()
 
-                # In interface we keep track of the host IP. If there was no
-                # modified TWs in the host NotIP, we check if the network was changed.
-                # Don't try to stop slips if it's capturing from an interface
-                if self.args.interface:
-                    # To check of there was a modified TW in the host IP. If not,
-                    # count down.
-                    modifiedTW_hostIP = False
-                    for profileIP in modified_profiles:
-                        # True if there was a modified TW in the host IP
-                        if hostIP == profileIP:
-                            modifiedTW_hostIP = True
+                if is_interface and hostIP not in modified_profiles:
+                    # In interface we keep track of the host IP. If there was no
+                    # modified TWs in the host IP, we check if the network was changed.
+                    if hostIP := self.get_host_ip():
+                        __database__.set_host_ip(hostIP)
 
-                    # If there was no modified TW in the host IP
+                # these are the cases where slips should be running non-stop
+                if self.is_debugger_active() or self.input_type == 'stdin' or is_interface:
+                    continue
+
+                # Reaches this point if we're running Slips on a file.
+                # countdown until slips stops if no TW modifications are happening
+                if modified_ips_in_the_last_tw == 0:
+                    # waited enough. stop slips
+                    if intervals_to_wait == 0:
+                        self.shutdown_gracefully()
+
+                    # If there were no modified TWs in the last timewindow time,
                     # then start counting down
-                    # After count down we update the host IP, to check if the
-                    # network was changed
-                    if not modifiedTW_hostIP and self.args.interface:
-                        if intervals_to_wait == 0:
-                            hostIP = self.get_host_ip()
-                            if hostIP:
-                                __database__.set_host_ip(hostIP)
-                            intervals_to_wait = max_intervals_to_wait
+                    intervals_to_wait -= 1
 
-                        intervals_to_wait -= 1
-                    else:
-                        intervals_to_wait = max_intervals_to_wait
-
-
-                # Running Slips in the file.
-                # If there were no modified TW in the last timewindow time,
-                # then start counting down
-                else:
-                    # don't shutdown slips if it's being debugged or reading flows from stdin
-                    if (
-                        amount_of_modified == 0
-                        and not self.is_debugger_active()
-                        and self.input_type != 'stdin'
-                    ):
-                        # print('Counter to stop Slips. Amount of modified
-                        # timewindows: {}. Stop counter: {}'.format(amount_of_modified, minimum_intervals_to_wait))
-                        if intervals_to_wait == 0:
-                            self.shutdown_gracefully()
-                            break
-                        intervals_to_wait -= 1
-                    else:
-                        intervals_to_wait = (
-                            max_intervals_to_wait
-                        )
 
                 __database__.pubsub.check_health()
         except KeyboardInterrupt:

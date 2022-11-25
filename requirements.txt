@@ -1,7 +1,7 @@
 maxminddb==2.2.0
 numpy==1.19.2
 watchdog==2.1.6
-redis==3.5.3
+redis>=3.5.2,<=3.5.3
 urllib3==1.26.7
 pandas==1.3.4
 tzlocal==2.1
@@ -27,6 +27,7 @@ scipy==1.7.3
 sklearn==0.0
 GitPython==3.1.14
 protobuf==3.20
+blinker
 setuptools
 pytest-dependency
 pyod

@@ -148,6 +148,7 @@ modules/leak_detector/yara_rules/compiled
 
 # ignore warden configuration file
 modules/CESNET/warden.conf
+
 # Anomaly detection saved to disk models
 modules/anomaly-detection/anomaly-detection-model
 
@@ -163,3 +164,10 @@ trustdb.db
 
 # ignore running redis servers logs
 running_slips_info.txt
+
+# ignore changes to redis.conf
+redis.conf
+modules/flowmldetection/scaler.bin
+modules/flowmldetection/model.bin
+databases/macaddress-db.json
+modules/flowmldetection/model.bin

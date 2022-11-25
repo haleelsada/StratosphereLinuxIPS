@@ -1,4 +1,3 @@
-# Your imports
 import hashlib
 from datetime import datetime, timezone, timedelta
 import validators
@@ -9,25 +8,30 @@ import json
 import time
 import platform
 import os
+import sys
 import ipaddress
+import configparser
+
 
 class Utils(object):
     name = 'utils'
     description = 'Common functions used by different modules of slips.'
     authors = ['Alya Gomaa']
-    supported_orgs = (
-            'google',
-            'microsoft',
-            'apple',
-            'facebook',
-            'twitter',
-        )
+
 
     def __init__(self):
         self.home_network_ranges = (
             '192.168.0.0/16',
             '172.16.0.0/12',
             '10.0.0.0/8',
+        )
+        self.home_network_ranges = list(map(ipaddress.ip_network, self.home_network_ranges))
+        self.supported_orgs = (
+            'google',
+            'microsoft',
+            'apple',
+            'facebook',
+            'twitter',
         )
         self.home_networks = ('192.168.0.0', '172.16.0.0', '10.0.0.0')
         self.threat_levels = {
@@ -42,6 +46,7 @@ class Utils(object):
             '%Y-%m-%d %H:%M:%S.%f',
             '%Y-%m-%d %H:%M:%S',
             '%Y-%m-%d %H:%M:%S.%f%z',
+            '%Y/%m/%d %H:%M:%S.%f%z',
             '%Y/%m/%d %H:%M:%S.%f',
             '%Y/%m/%d %H:%M:%S',
             '%Y-%m-%d %H:%M:%S%z',
@@ -52,8 +57,26 @@ class Utils(object):
 
          )
         # this format will be used accross all modules and logfiles of slips
-        self.alerts_format = '%Y/%m/%d %H:%M:%S'
+        self.alerts_format = '%Y/%m/%d %H:%M:%S.%f%z'
 
+    def threat_level_to_string(self, threat_level: float):
+        for str_lvl, int_value in self.threat_levels.items():
+            if float(threat_level) <= int_value:
+                return str_lvl
+
+
+
+    def sanitize(self, string):
+        """
+        Sanitize strings taken from the user
+        """
+        string = string.replace(';', '')
+        string = string.replace('\`', '')
+        string = string.replace('&', '')
+        string = string.replace('|', '')
+        string = string.replace('$(', '')
+        string = string.replace('\n', '')
+        return string
 
     def detect_data_type(self, data):
         """Detects if incoming data is ipv4, ipv6, domain or ip range"""
@@ -203,8 +226,14 @@ class Utils(object):
     def to_delta(self, time_in_seconds):
         return timedelta(seconds=int(time_in_seconds))
 
-    def get_own_IPs(self):
-        """Returns a list of our local and public IPs"""
+    def get_own_IPs(self) -> list:
+        """
+        Returns a list of our local and public IPs
+        """
+        if '-i' not in sys.argv:
+            # this method is only valid when running on an interface
+            return []
+
         IPs = []
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -227,6 +256,25 @@ class Utils(object):
 
     def convert_to_mb(self, bytes):
         return int(bytes)/(10**6)
+
+    def is_ignored_ip(self, ip) -> bool:
+        """
+        This function checks if an IP is a special list of IPs that
+        should not be alerted for different reasons
+        """
+        ip_obj = ipaddress.ip_address(ip)
+        # Is the IP multicast, private? (including localhost)
+        # local_link or reserved?
+        # The broadcast address 255.255.255.255 is reserved.
+        if (
+            ip_obj.is_multicast
+            or ip_obj.is_private
+            or ip_obj.is_link_local
+            or ip_obj.is_reserved
+            or '.255' in ip_obj.exploded
+        ):
+            return True
+        return False
 
     def get_hash_from_file(self, filename):
         """
@@ -461,5 +509,16 @@ class Utils(object):
 
         return IDEA_dict
 
+    def timing(f):
+        """Function to measure the time another function takes."""
+
+        def wrap(*args):
+            time1 = time.time()
+            ret = f(*args)
+            time2 = time.time()
+            print('[DB] Function took {:.3f} ms'.format((time2 - time1) * 1000.0))
+            return ret
+
+        return wrap
 
 utils = Utils()

@@ -149,6 +149,10 @@ class TrustDB:
         confidence: float,
         timestamp: int = None,
     ):
+        # print(f"*** [debugging p2p] ***  [insert_new_go_report] is called. receieved "
+        #       f"from {reporter_peerid} a report about {reported_key} "
+        #       f"score: {score} confidence: {confidence} timestamp: {timestamp} ")
+
         if timestamp is None:
             timestamp = datetime.datetime.now()
         timestamp = time.time()
@@ -201,7 +205,28 @@ class TrustDB:
             result = None, None, None, None
         return result
 
+
+    def get_ip_of_peer(self, peerid):
+        """
+        Returns the latest IP seen associated with the given peerid
+        :param peerid: the id of the peer we want the ip of
+        """
+        cache_cur = self.conn.execute(
+            'SELECT MAX(update_time) AS ip_update_time, ipaddress FROM peer_ips WHERE peerid = ?;',
+            ((peerid),)
+        )
+        res = cache_cur.fetchone()
+        if res:
+            last_update_time, ip = res
+            return last_update_time, ip
+        return False, False
+
+
+
     def get_opinion_on_ip(self, ipaddress: str):
+        """
+        :param ipaddress: The ip we're asking other peers about
+        """
         reports_cur = self.conn.execute(
             'SELECT reports.reporter_peerid AS reporter_peerid,'
             '       MAX(reports.update_time) AS report_timestamp,'
@@ -245,6 +270,11 @@ class TrustDB:
                 'peerid': reporter_peerid,
                 'ipaddress': reporter_ipaddress,
             }
+
+            # probably what this query means is:
+            # get latest reports by this peer, whether using it's peer ID or IP
+            # within this time range: last update time until now
+
             slips_reputation_cur = self.conn.execute(
                 'SELECT * FROM (  '
                 '    SELECT b.update_time AS lower_bound,  '

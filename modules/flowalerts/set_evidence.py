@@ -1,5 +1,5 @@
 # Must imports
-from slips_files.core.database import __database__
+from slips_files.core.database.database import __database__
 from slips_files.common.slips_utils import utils
 
 # Your imports
@@ -146,6 +146,37 @@ class Helper:
             uid=uid,
         )
 
+
+    def set_evidence_pastebin_download(
+            self, daddr, bytes_downloaded, timestamp, profileid, twid, uid
+       ):
+        type_detection = 'dstip'
+        source_target_tag = 'Malware'
+        detection_info = daddr
+        type_evidence = 'PastebinDownload'
+        threat_level = 'info'
+        category = 'Anomaly.Behaviour'
+        confidence = 1
+        response_body_len = utils.convert_to_mb(bytes_downloaded)
+        description = (
+           f'A downloaded file from pastebin.com. size: {response_body_len} MBs'
+        )
+        __database__.setEvidence(
+            type_evidence,
+            type_detection,
+            detection_info,
+            threat_level,
+            confidence,
+            description,
+            timestamp,
+            category,
+            source_target_tag=source_target_tag,
+            profileid=profileid,
+            twid=twid,
+            uid=uid,
+        )
+        return True
+
     def set_evidence_conn_without_dns(
         self, daddr, timestamp, profileid, twid, uid
     ):
@@ -161,7 +192,8 @@ class Helper:
         start_time = __database__.get_slips_start_time()
         now = time.time()
         confidence = 0.8
-        if '-i' in sys.argv:
+        running_on_interface = '-i' in sys.argv or __database__.is_growing_zeek_dir()
+        if running_on_interface:
             diff = utils.get_time_diff(start_time, now, return_type='hours')
             if diff < 5:
                 confidence = 0.1
@@ -216,9 +248,9 @@ class Helper:
         confidence = 1
         threat_level = 'high'
         category = 'Anomaly.Connection'
-        type_detection = 'dstip'
+        type_detection = 'srcip'
         type_evidence = 'UnknownPort'
-        detection_info = daddr
+        detection_info = profileid.split('_')[-1]
         ip_identification = __database__.getIPIdentification(daddr)
         description = (
             f'Connection to unknown destination port {dport}/{proto.upper()} '
@@ -241,22 +273,21 @@ class Helper:
             uid=uid,
         )
 
-    def set_evidence_pw_guessing(self, msg, timestamp, profileid, twid, uid):
+    def set_evidence_pw_guessing(self, description, timestamp, profileid, twid, uid, conn_count, scanning_ip, by=''):
         # 222.186.30.112 appears to be guessing SSH passwords (seen in 30 connections)
         # confidence = 1 because this detection is comming from a zeek file so we're sure it's accurate
         confidence = 1
         threat_level = 'high'
         category = 'Attempt.Login'
-        description = f'password guessing by Zeek enegine. {msg}'
         type_evidence = 'Password_Guessing'
         type_detection = 'srcip'
         source_target_tag = 'Malware'
-        detection_info = msg.split(' appears')[0]
-        conn_count = int(msg.split('in ')[1].split('connections')[0])
+        description += f'. by {by}.'
+
         __database__.setEvidence(
             type_evidence,
             type_detection,
-            detection_info,
+            scanning_ip,
             threat_level,
             confidence,
             description,
@@ -276,7 +307,7 @@ class Helper:
         confidence = 1
         threat_level = 'medium'
         description = f'horizontal port scan by Zeek engine. {msg}'
-        type_evidence = 'PortScanType2'
+        type_evidence = 'HorizontalPortscan'
         type_detection = 'dport'
         source_target_tag = 'Recon'
         detection_info = scanned_port
@@ -307,11 +338,11 @@ class Helper:
         threat_level = 'medium'
         # msg example: 192.168.1.200 has scanned 60 ports of 192.168.1.102
         description = f'vertical port scan by Zeek engine. {msg}'
-        type_evidence = 'PortScanType1'
+        type_evidence = 'VerticalPortscan'
         category = 'Recon.Scanning'
         type_detection = 'dstip'
         source_target_tag = 'Recon'
-        conn_count = int(msg.split('scanned')[1].split('ports')[0])
+        conn_count = int(msg.split('least ')[1].split(' unique')[0])
         detection_info = scanning_ip
         __database__.setEvidence(
             type_evidence,
@@ -352,7 +383,7 @@ class Helper:
         detection_info = saddr
         type_evidence = f'SSHSuccessful-by-{saddr}'
         threat_level = 'info'
-        confidence = 0.5
+        confidence = 0.8
         category = 'Infomation'
         ip_identification = __database__.getIPIdentification(daddr)
         description = (
@@ -520,7 +551,7 @@ class Helper:
         )
 
     def set_evidence_for_port_0_connection(
-        self, saddr, daddr, direction, profileid, twid, uid, timestamp
+        self, saddr, daddr, sport, dport, direction, profileid, twid, uid, timestamp
     ):
         """:param direction: 'source' or 'destination'"""
         confidence = 0.8
@@ -531,12 +562,8 @@ class Helper:
         type_evidence = 'Port0Connection'
         detection_info = saddr if direction == 'source' else daddr
 
-        if direction == 'source':
-            ip_identification = __database__.getIPIdentification(daddr)
-            description = f'Connection on port 0 from {saddr} to {daddr}. {ip_identification}.'
-        else:
-            ip_identification = __database__.getIPIdentification(saddr)
-            description = f'Connection on port 0 from {daddr} to {saddr}. {ip_identification}'
+        ip_identification = __database__.getIPIdentification(daddr)
+        description = f'Connection on port 0 from {saddr}:{sport} to {daddr}:{dport}. {ip_identification}.'
 
         conn_count = 1
 
@@ -568,7 +595,7 @@ class Helper:
         ioc='',
     ):
         malicious_ja3_dict = json.loads(malicious_ja3_dict[ioc])
-        tags = malicious_ja3_dict['tags']
+        tags = malicious_ja3_dict.get('tags','')
         ja3_description = malicious_ja3_dict['description']
         threat_level = malicious_ja3_dict['threat_level']
 
@@ -613,9 +640,8 @@ class Helper:
 
     def set_evidence_data_exfiltration(
         self,
-        most_contacted_daddr,
-        total_mbytes,
-        times_contacted,
+        daddr,
+        src_mbs,
         profileid,
         twid,
         uid,
@@ -626,12 +652,12 @@ class Helper:
         source_target_tag = 'OriginMalware'
         type_evidence = 'DataUpload'
         category = 'Malware'
-        detection_info = most_contacted_daddr
+        detection_info = daddr
         ip_identification = __database__.getIPIdentification(
-            most_contacted_daddr
+            daddr
         )
-        description = f'possible data upload. {total_mbytes} MBs sent to {most_contacted_daddr} '
-        description += f'IP contacted {times_contacted} times in the past 1h. {ip_identification}'
+        description = f'possible data upload. {src_mbs} MBs sent to {daddr} '
+        description += f'{ip_identification}'
         timestamp = utils.convert_format(datetime.datetime.now(), utils.alerts_format)
         __database__.setEvidence(
             type_evidence,

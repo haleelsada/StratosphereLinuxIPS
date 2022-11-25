@@ -19,8 +19,8 @@ import multiprocessing
 import json
 from datetime import datetime, timedelta
 import sys
-import configparser
-from .database import __database__
+from slips_files.core.database.database import __database__
+from slips_files.common.config_parser import ConfigParser
 from slips_files.common.slips_utils import utils
 import ipaddress
 import traceback
@@ -36,21 +36,19 @@ class ProfilerProcess(multiprocessing.Process):
     """A class to create the profiles for IPs and the rest of data"""
 
     def __init__(
-        self, inputqueue, outputqueue, verbose, debug, config, redis_port
+        self, inputqueue, outputqueue, verbose, debug, redis_port
     ):
-        self.name = 'ProfilerProcess'
+        self.name = 'Profiler'
         multiprocessing.Process.__init__(self)
         self.inputqueue = inputqueue
         self.outputqueue = outputqueue
-        self.config = config
         self.columns_defined = False
         self.timeformat = None
         self.input_type = False
-        self.whitelist = Whitelist(outputqueue, config, redis_port)
+        self.whitelist = Whitelist(outputqueue, redis_port)
         # Read the configuration
         self.read_configuration()
-        # Start the DB
-        __database__.start(self.config, redis_port)
+        __database__.start(redis_port)
         # Set the database output queue
         __database__.setOutputQueue(self.outputqueue)
         # 1st. Get the data from the interpreted columns
@@ -92,44 +90,13 @@ class ProfilerProcess(multiprocessing.Process):
         self.outputqueue.put(f'{levels}|{self.name}|{text}')
 
     def read_configuration(self):
-        """Read the configuration file for what we need"""
-
-        def get(section, value, default_value):
-            """
-            read the given value from the given section in slips.conf
-            on error set the value to the default value
-            """
-            try:
-                 return self.config.get(section, value)
-            except (
-                configparser.NoOptionError,
-                configparser.NoSectionError,
-                NameError,
-            ):
-                # There is a conf, but there is no option, or no section or no
-                # configuration file specified
-                return default_value
-
-
-        self.whitelist_path = get('parameters', 'whitelist_path', 'whitelist.conf')
-        self.timeformat = get('timestamp', 'format', None)
-        self.analysis_direction = get('parameters', 'analysis_direction', 'all')
-        self.label = get('parameters', 'label', 'unknown')
-
-        self.home_net = get('parameters', 'home_network', False)
-        if self.home_net:
-            self.home_net = ipaddress.ip_network(self.home_net)
-
-        self.width = get('parameters', 'time_window_width', 3600)
-        if 'only_one_tw' in str(self.width):
-            # Only one tw. Width is 10 9s, wich is ~11,500 days, ~311 years
-            self.width = 9999999999
-            self.print(
-                f'Time Windows Width used: {self.width} seconds.'
-                f' Only 1 time windows. Dates in the names of files are 100 years in the past.',3,0
-            )
-        else:
-            self.width = float(self.width)
+        conf = ConfigParser()
+        self.whitelist_path = conf.whitelist_path()
+        self.timeformat = conf.ts_format()
+        self.analysis_direction = conf.analysis_direction()
+        self.label = conf.label()
+        self.home_net = conf.get_home_network()
+        self.width = conf.get_tw_width_as_float()
 
     def define_type(self, line):
         """
@@ -416,17 +383,14 @@ class ProfilerProcess(multiprocessing.Process):
             except IndexError:
                 self.column_values['rcode_name'] = ''
             try:
-                self.column_values['answers'] = line[21]
-                if type(self.column_values['answers']) == str:
+                answers = line[21]
+                if type(answers) == str:
                     # If the answer is only 1, Zeek gives a string
                     # so convert to a list
-                    self.column_values['answers'] = [
-                        self.column_values['answers']
-                    ]
-                if type(self.column_values['answers']) == str:
-                    # If the answer is only 1, Zeek gives a string
-                    # so convert to a list
-                    self.column_values['answers'] = [self.column_values['answers']]
+                    answers = answers.split(',')
+                # ignore dns TXT records
+                answers = [answer for answer in answers if 'TXT ' not in answer]
+                self.column_values['answers'] = answers
             except IndexError:
                 self.column_values['answers'] = ''
             try:
@@ -558,7 +522,7 @@ class ProfilerProcess(multiprocessing.Process):
             # Zeek can put in column 7 the auth success if it has one
             # or the auth attempts only. However if the auth
             # success is there, the auth attempts are too.
-            if 'success' in line[7]:
+            if 'T' in line[7]:
                 try:
                     self.column_values['auth_success'] = line[7]
                 except IndexError:
@@ -599,7 +563,7 @@ class ProfilerProcess(multiprocessing.Process):
                     self.column_values['host_key'] = line[17]
                 except IndexError:
                     self.column_values['host_key'] = ''
-            elif 'success' not in line[7]:
+            elif 'T' not in line[7]:
                 self.column_values['auth_success'] = ''
                 try:
                     self.column_values['auth_attempts'] = line[7]
@@ -769,7 +733,7 @@ class ProfilerProcess(multiprocessing.Process):
 
         # Generic fields in Zeek
         self.column_values = {}
-        # We need to set it to empty at the beggining so any new flow has the key 'type'
+        # We need to set it to empty at the beginning so any new flow has the key 'type'
         self.column_values['type'] = ''
 
         # to set the default value to '' if ts isn't found
@@ -812,6 +776,8 @@ class ProfilerProcess(multiprocessing.Process):
                     'dmac': line.get('resp_l2_addr', ''),
                 }
             )
+            # orig_bytes: The number of payload bytes the src sent.
+            # orig_ip_bytes: the length of the header + the payload
 
         elif 'dns' in file_type:
             self.column_values.update(
@@ -1018,18 +984,6 @@ class ProfilerProcess(multiprocessing.Process):
                     'dst_hw': line.get('resp_hw', ''),
                     'src_hw': line.get('orig_hw', ''),
                     'operation': line.get('operation', ''),
-                }
-            )
-        elif 'known_services' in file_type:
-            self.column_values.update(
-                {
-                    'type': 'known_services',
-                    'saddr': line.get('host', ''),
-                    # this file doesn't have a daddr field, but we need it in add_flow_to_profile
-                    'daddr': '0.0.0.0',
-                    'port_num': line.get('port_num', ''),
-                    'port_proto': line.get('port_proto', ''),
-                    'service': line.get('service', ''),
                 }
             )
         elif 'software' in file_type:
@@ -1511,6 +1465,31 @@ class ProfilerProcess(multiprocessing.Process):
                     self.column_values['filesize'] = line['fileinfo']['size']
                 except KeyError:
                     self.column_values['filesize'] = ''
+            elif self.column_values['type'] == 'ssh':
+                try:
+                    self.column_values['client'] = line['ssh']['client']['software_version']
+                except KeyError:
+                    self.column_values['client'] = ''
+
+                try:
+                    self.column_values['version'] = line['ssh']['client']['proto_version']
+                except KeyError:
+                    self.column_values['version'] = ''
+
+                try:
+                    self.column_values['server'] = line['ssh']['server']['software_version']
+                except KeyError:
+                    self.column_values['server'] = ''
+                # these fields aren't available in suricata, they're available in zeek only
+                self.column_values['auth_success'] = ''
+                self.column_values['auth_attempts'] = ''
+                self.column_values['cipher_alg'] = ''
+                self.column_values['mac_alg'] = ''
+                self.column_values['kex_alg'] = ''
+                self.column_values['compression_alg'] = ''
+                self.column_values['host_key_alg'] = ''
+                self.column_values['host_key'] = ''
+
 
     def publish_to_new_MAC(self, mac, ip, host_name=False):
         """
@@ -1520,26 +1499,26 @@ class ProfilerProcess(multiprocessing.Process):
         :param ip: src/dst ip
         src macs should be passed with srcips, dstmac with dstips
         """
-        if not mac:
+        if not mac or mac in ('00:00:00:00:00:00', 'ff:ff:ff:ff:ff:ff'):
             return
         # get the src and dst addresses as objects
         try:
             ip_obj = ipaddress.ip_address(ip)
+            if ip_obj.is_multicast:
+                return
         except ValueError:
             return
-        if mac not in ('00:00:00:00:00:00', 'ff:ff:ff:ff:ff:ff') and not (
-            ip_obj.is_multicast or ip_obj.is_link_local
-        ):
-            # send the src and dst MAC to IP_Info module to get vendor info about this MAC
-            to_send = {
-                'MAC': mac,
-                'profileid': f'profile_{ip}'
-            }
-            if host_name:
-                to_send.update({
-                    'host_name': host_name
-                })
-            __database__.publish('new_MAC', json.dumps(to_send))
+
+        # send the src and dst MAC to IP_Info module to get vendor info about this MAC
+        to_send = {
+            'MAC': mac,
+            'profileid': f'profile_{ip}'
+        }
+        if host_name:
+            to_send.update({
+                'host_name': host_name
+            })
+        __database__.publish('new_MAC', json.dumps(to_send))
 
     def is_supported_flow(self):
 
@@ -1555,7 +1534,6 @@ class ProfilerProcess(multiprocessing.Process):
             'notice',
             'dhcp',
             'files',
-            'known_services',
             'arp',
             'ftp',
             'smtp',
@@ -1622,7 +1600,7 @@ class ProfilerProcess(multiprocessing.Process):
             )
 
         # in the database, Find the id of the tw where the flow belongs.
-        rev_twid = self.get_timewindow(self.starttime, rev_profileid)
+        rev_twid = __database__.get_timewindow(self.starttime, rev_profileid)
         return rev_profileid, rev_twid
 
     def publish_to_new_dhcp(self):
@@ -1638,7 +1616,7 @@ class ProfilerProcess(multiprocessing.Process):
             'server_addr': self.column_values.get('server_addr', False),
             'client_addr': self.column_values.get('client_addr', False),
             'profileid': self.profileid,
-            'twid': self.get_timewindow(epoch_time, self.profileid),
+            'twid': __database__.get_timewindow(epoch_time, self.profileid),
             'ts': epoch_time
         }
         __database__.publish('new_dhcp', json.dumps(to_send))
@@ -1652,7 +1630,7 @@ class ProfilerProcess(multiprocessing.Process):
         self.column_values.update(
             {
                 'starttime': epoch_time,
-                'twid': self.get_timewindow(epoch_time, self.profileid),
+                'twid': __database__.get_timewindow(epoch_time, self.profileid),
             }
         )
         __database__.publish(
@@ -1696,22 +1674,25 @@ class ProfilerProcess(multiprocessing.Process):
             )
             self.starttime = self.get_starttime()
             # For this 'forward' profile, find the id in the database of the tw where the flow belongs.
-            self.twid = self.get_timewindow(self.starttime, self.profileid)
+            self.twid = __database__.get_timewindow(self.starttime, self.profileid)
+
             if self.home_net:
-                # Home. Create profiles for home IPs only
-                if self.saddr_as_obj in self.home_net:
-                    __database__.addProfile(
-                        self.profileid, self.starttime, self.width
-                    )
-                    self.store_features_going_out()
+                # Home network is defined in slips.conf. Create profiles for home IPs only
+                for network in self.home_net:
+                    if self.saddr_as_obj in network:
+                        __database__.addProfile(
+                            self.profileid, self.starttime, self.width
+                        )
+                        self.store_features_going_out()
 
-                if self.analysis_direction == 'all':
-                    # in all mode we create profiled for daddrs too
-                    if self.daddr_as_obj in self.home_net:
-                        self.handle_in_flows()
+                    if self.analysis_direction == 'all':
+                        # in all mode we create profiled for daddrs too
+                        if self.daddr_as_obj in network:
+                            self.handle_in_flows()
+            else:
 
-            elif not self.home_net:
-                # No home. Create profiles for everybody
+                # home_network param wasn't set in slips.conf.
+                # Create profiles for everybody
                 __database__.addProfile(self.profileid, self.starttime, self.width)
                 self.store_features_going_out()
                 if self.analysis_direction == 'all':
@@ -1721,7 +1702,7 @@ class ProfilerProcess(multiprocessing.Process):
         except Exception as inst:
             # For some reason we can not use the output queue here.. check
             self.print(
-                f'Error in add_flow_to_profile profilerProcess. {traceback.format_exc()}'
+                f'Error in add_flow_to_profile Profiler Process. {traceback.format_exc()}'
             ,0,1)
             self.print('{}'.format(type(inst)), 0, 1)
             self.print('{}'.format(inst), 0, 1)
@@ -1791,6 +1772,7 @@ class ProfilerProcess(multiprocessing.Process):
         __database__.add_out_dns(
             self.profileid,
             self.twid,
+            self.column_values['daddr'],
             self.starttime,
             self.flow_type,
             self.uid,
@@ -1955,20 +1937,6 @@ class ProfilerProcess(multiprocessing.Process):
         to_send = json.dumps(to_send)
         __database__.publish('new_downloaded_file', to_send)
 
-    def handle_known_services(self, ):
-        # Send known_services.log data to new_service channel in flowalerts module
-        to_send = {
-            'uid': self.uid,
-            'saddr': self.saddr,
-            'port_num': self.column_values['port_num'],
-            'port_proto': self.column_values['port_proto'],
-            'service': self.column_values['service'],
-            'profileid': self.profileid,
-            'twid': self.twid,
-            'ts': self.starttime,
-        }
-        to_send = json.dumps(to_send)
-        __database__.publish('new_service', to_send)
 
     def handle_arp(self):
         to_send = {
@@ -2025,7 +1993,6 @@ class ProfilerProcess(multiprocessing.Process):
             'ftp': self.handle_ftp,
             'smtp': self.handle_smtp,
             'files': self.handle_files,
-            'known_services': self.handle_known_services,
             'arp': self.handle_arp,
             'dhcp': self.handle_dhcp,
             'software': self.handle_software
@@ -2036,7 +2003,7 @@ class ProfilerProcess(multiprocessing.Process):
             # call the function that handles this flow
             cases[self.flow_type]()
         except KeyError:
-            # does flow contain a part of the key
+            # does flow contain a part of the key?
             for flow in cases:
                 if flow in self.flow_type:
                     cases[flow]()
@@ -2352,145 +2319,16 @@ class ProfilerProcess(multiprocessing.Process):
             return symbol, (last_ts, now_ts)
         except Exception as inst:
             # For some reason we can not use the output queue here.. check
-            self.print('Error in compute_symbol in profilerProcess.', 0, 1)
+            self.print('Error in compute_symbol in Profiler Process.', 0, 1)
             self.print('{}'.format(type(inst)), 0, 1)
             self.print('{}'.format(inst), 0, 1)
             self.print('{}'.format(traceback.format_exc()), 0, 1)
 
-    def get_timewindow(self, flowtime, profileid):
-        """ "
-        This function should get the id of the TW in the database where the flow belong.
-        If the TW is not there, we create as many tw as necessary in the future or past until we get the correct TW for this flow.
-        - We use this function to avoid retrieving all the data from the DB for the complete profile. We use a separate table for the TW per profile.
-        -- Returns the time window id
-        THIS IS NOT WORKING:
-        - The empty profiles in the middle are not being created!!!
-        - The Dtp ips are stored in the first time win
-        """
-        try:
-            # First check if we are not in the last TW. Since this will be the majority of cases
-            try:
-                if not profileid:
-                    # profileid is None if we're dealing with a profile
-                    # outside of home_network when this param is given
-                    return False
-                [(lasttwid, lasttw_start_time)] = __database__.getLastTWforProfile(profileid)
-                lasttw_start_time = float(lasttw_start_time)
-                lasttw_end_time = lasttw_start_time + self.width
-                flowtime = float(flowtime)
-                self.print(
-                    'The last TW id for profile {} was {}. Start:{}. End: {}'.format(
-                        profileid, lasttwid, lasttw_start_time, lasttw_end_time
-                    ), 3,0,
-                )
-                # There was a last TW, so check if the current flow belongs here.
-                if (
-                    lasttw_end_time > flowtime
-                    and lasttw_start_time <= flowtime
-                ):
-                    self.print(
-                        'The flow ({}) is on the last time window ({})'.format(
-                            flowtime, lasttw_end_time
-                        ), 3, 0
-                    )
-                    twid = lasttwid
-                elif lasttw_end_time <= flowtime:
-                    # The flow was not in the last TW, its NEWER than it
-                    self.print(
-                        'The flow ({}) is NOT on the last time window ({}). Its newer'.format(
-                            flowtime, lasttw_end_time
-                        ), 3, 0
-                    )
-                    amount_of_new_tw = int(
-                        (flowtime - lasttw_end_time) / self.width
-                    )
-                    self.print(
-                        'We have to create {} empty TWs in the midle.'.format(
-                            amount_of_new_tw
-                        ), 3, 0
-                    )
-                    temp_end = lasttw_end_time
-                    for id in range(0, amount_of_new_tw + 1):
-                        new_start = temp_end
-                        twid = __database__.addNewTW(profileid, new_start)
-                        self.print(
-                            'Creating the TW id {}. Start: {}.'.format(
-                                twid, new_start
-                            ), 3, 0
-                        )
-                        temp_end = new_start + self.width
-                    # Now get the id of the last TW so we can return it
-                elif lasttw_start_time > flowtime:
-                    # The flow was not in the last TW, its OLDER that it
-                    self.print(
-                        'The flow ({}) is NOT on the last time window ({}). Its older'.format(
-                            flowtime, lasttw_end_time
-                        ), 3, 0
-                    )
-                    # Find out if we already have this TW in the past
-                    data = __database__.getTWofTime(profileid, flowtime)
-                    if data:
-                        # We found a TW where this flow belongs to
-                        (twid, tw_start_time) = data
-                        return twid
-                    else:
-                        # There was no TW that included the time of this flow, so create them in the past
-                        # How many new TW we need in the past?
-                        # amount_of_new_tw is the total amount of tw we should have under the new situation
-                        amount_of_new_tw = int(
-                            (lasttw_end_time - flowtime) / self.width
-                        )
-                        # amount_of_current_tw is the real amount of tw we have now
-                        amount_of_current_tw = (
-                            __database__.getamountTWsfromProfile(profileid)
-                        )
-                        # diff is the new ones we should add in the past. (Yes, we could have computed this differently)
-                        diff = amount_of_new_tw - amount_of_current_tw
-                        self.print(
-                            'We need to create {} TW before the first'.format(
-                                diff + 1
-                            ), 3, 0
-                        )
-                        # Get the first TW
-                        [
-                            (firsttwid, firsttw_start_time)
-                        ] = __database__.getFirstTWforProfile(profileid)
-                        firsttw_start_time = float(firsttw_start_time)
-                        # The start of the new older TW should be the first - the width
-                        temp_start = firsttw_start_time - self.width
-                        for id in range(0, diff + 1):
-                            new_start = temp_start
-                            # The method to add an older TW is the same as
-                            # to add a new one, just the starttime changes
-                            twid = __database__.addNewOlderTW(
-                                profileid, new_start
-                            )
-                            self.print(
-                                'Creating the new older TW id {}. Start: {}.'.format(
-                                    twid, new_start
-                                ), 3, 0
-                            )
-                            temp_start = new_start - self.width
-            except ValueError:
-                # There is no last tw. So create the first TW
-                # If the option for only-one-tw was selected, we should create the TW at least 100 years before the flowtime, to cover for
-                # 'flows in the past'. Which means we should cover for any flow that is coming later with time before the first flow
-                if self.width == 9999999999:
-                    # Seconds in 1 year = 31536000
-                    startoftw = float(flowtime - (31536000 * 100))
-                else:
-                    startoftw = float(flowtime)
-                # Add this TW, of this profile, to the DB
-                twid = __database__.addNewTW(profileid, startoftw)
-                # self.print("First TW ({}) created for profile {}.".format(twid, profileid), 0, 1)
-            return twid
-        except Exception as e:
-            self.print('Error in get_timewindow().', 0, 1)
-            self.print('{}'.format(e), 0, 1)
+
 
     def shutdown_gracefully(self):
         # can't use self.name because multiprocessing library adds the child number to the name so it's not const
-        __database__.publish('finished_modules', 'ProfilerProcess')
+        __database__.publish('finished_modules', 'Profiler')
 
     def run(self):
         utils.drop_root_privs()
@@ -2551,8 +2389,6 @@ class ProfilerProcess(multiprocessing.Process):
                                 }
                             )
                         _ = self.column_idx['starttime']
-                        # Yes
-                        # Quickly process all lines
                         self.process_argus_input(line)
                         # Add the flow to the profile
                         self.add_flow_to_profile()
@@ -2579,7 +2415,7 @@ class ProfilerProcess(multiprocessing.Process):
                     self.print("Can't recognize input file type.")
 
                 # listen on this channel in case whitelist.conf is changed, we need to process the new changes
-                message = self.c1.get_message(timeout=self.timeout)
+                message = __database__.get_message(self.c1)
                 if message and message['data'] == 'stop_process':
                     self.shutdown_gracefully()
                     return True

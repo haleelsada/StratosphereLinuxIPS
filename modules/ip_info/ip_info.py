@@ -1,7 +1,7 @@
 # Must imports
 from slips_files.common.abstracts import Module
 import multiprocessing
-from slips_files.core.database import __database__
+from slips_files.core.database.database import __database__
 from slips_files.common.slips_utils import utils
 from .asn_info import ASN
 import platform
@@ -18,24 +18,22 @@ import json
 from contextlib import redirect_stdout
 import subprocess
 import re
+import time
+import asyncio
 
 
 class Module(Module, multiprocessing.Process):
     # Name: short name of the module. Do not use spaces
-    name = 'ip_info'
+    name = 'IP Info'
     description = 'Get different info about an IP/MAC address'
     authors = ['Alya Gomaa', 'Sebastian Garcia']
 
-    def __init__(self, outputqueue, config, redis_port):
+    def __init__(self, outputqueue, redis_port):
         multiprocessing.Process.__init__(self)
         # All the printing output should be sent to the outputqueue. The outputqueue is connected to another process called OutputProcess
         self.outputqueue = outputqueue
-        # In case you need to read the slips.conf configuration file for your own configurations
-        self.config = config
-        # Start the redis DB
-        __database__.start(self.config, redis_port)
-        # open mmdbs
-        self.open_dbs()
+        __database__.start(redis_port)
+        self.pending_mac_queries = multiprocessing.Queue()
         self.asn = ASN()
         # Set the output queue of our database instance
         __database__.setOutputQueue(self.outputqueue)
@@ -44,7 +42,6 @@ class Module(Module, multiprocessing.Process):
         self.c2 = __database__.subscribe('new_MAC')
         self.c3 = __database__.subscribe('new_dns_flow')
         self.c4 = __database__.subscribe('new_dhcp')
-        self.timeout = 0.0000001
         # update asn every 1 month
         self.update_period = 2592000
         # we can only getthe age of these tlds
@@ -151,9 +148,8 @@ class Module(Module, multiprocessing.Process):
             '.za',
         ]
 
-    def open_dbs(self):
+    async def open_dbs(self):
         """Function to open the different offline databases used in this module. ASN, Country etc.."""
-
         # Open the maxminddb ASN offline db
         try:
             self.asn_db = maxminddb.open_database(
@@ -178,13 +174,19 @@ class Module(Module, multiprocessing.Process):
                 'Please note it must be the MaxMind DB version.'
             )
 
-        try:
-            self.mac_db = open('databases/macaddress-db.json', 'r')
-        except OSError:
-            self.print(
-                'Error opening the macaddress db in databases/macaddress-db.json. '
-                'Please download it from https://macaddress.io/database-download/json.'
-            )
+        asyncio.create_task(self.read_macdb())
+
+    async def read_macdb(self):
+        while True:
+            try:
+                self.mac_db = open('databases/macaddress-db.json', 'r')
+                return True
+            except OSError:
+                # update manager hasn't downloaded it yet
+                try:
+                    time.sleep(3)
+                except KeyboardInterrupt:
+                    return False
 
     def print(self, text, verbose=1, debug=0):
         """
@@ -214,8 +216,10 @@ class Module(Module, multiprocessing.Process):
         """
         if not hasattr(self, 'country_db'):
             return False
-
-        if geoinfo := self.country_db.get(ip):
+        if ipaddress.ip_address(ip).is_private:
+            # Try to find if it is a local/private IP
+            data = {'geocountry': 'Private'}
+        elif geoinfo := self.country_db.get(ip):
             try:
                 countrydata = geoinfo['country']
                 countryname = countrydata['names']['en']
@@ -223,9 +227,6 @@ class Module(Module, multiprocessing.Process):
             except KeyError:
                 data = {'geocountry': 'Unknown'}
 
-        elif ipaddress.ip_address(ip).is_private:
-            # Try to find if it is a local/private IP
-            data = {'geocountry': 'Private'}
         else:
             data = {'geocountry': 'Unknown'}
         __database__.setInfoForIPs(ip, data)
@@ -285,8 +286,16 @@ class Module(Module, multiprocessing.Process):
         ):
             return False
 
+    def get_vendor_offline(self, mac_addr, host_name, profileid):
+        """
+        Gets vendor from Slips' offline database databases/macaddr-db.json
+        """
+        if not hasattr(self, 'mac_db'):
+            # when update manager is done updating the mac db, we should ask
+            # the db for all these pending queries
+            self.pending_mac_queries.put((mac_addr, host_name, profileid))
+            return False
 
-    def get_vendor_offline(self, mac_addr):
         oui = mac_addr[:8].upper()
         # parse the mac db and search for this oui
         self.mac_db.seek(0)
@@ -299,7 +308,7 @@ class Module(Module, multiprocessing.Process):
 
             if oui in line:
                 line = json.loads(line)
-                vendor = line['companyName']
+                vendor = line['vendorName']
                 return vendor
 
     def get_vendor(self, mac_addr: str, host_name: str, profileid: str):
@@ -309,8 +318,7 @@ class Module(Module, multiprocessing.Process):
         """
 
         if (
-            not hasattr(self, 'mac_db')
-            or 'ff:ff:ff:ff:ff:ff' in mac_addr.lower()
+            'ff:ff:ff:ff:ff:ff' in mac_addr.lower()
             or '00:00:00:00:00:00' in mac_addr.lower()
         ):
             return False
@@ -326,7 +334,7 @@ class Module(Module, multiprocessing.Process):
         if host_name:
             MAC_info['host_name'] = host_name
 
-        if vendor:= self.get_vendor_offline(mac_addr):
+        if vendor:= self.get_vendor_offline(mac_addr, host_name, profileid):
             MAC_info['Vendor'] = vendor
         elif vendor:= self.get_vendor_online(mac_addr):
             MAC_info['Vendor'] = vendor
@@ -339,6 +347,9 @@ class Module(Module, multiprocessing.Process):
 
     # domain info
     def get_age(self, domain):
+        """
+        Get the age of a domain using whois library
+        """
 
         if domain.endswith('.arpa') or domain.endswith('.local'):
             return False
@@ -365,21 +376,7 @@ class Module(Module, multiprocessing.Process):
                 # get registration date
                 try:
                     creation_date = whois.query(domain).creation_date
-                except AttributeError:
-                    # the query doesn't have a creation date
-                    return False
-                except whois.exceptions.UnknownTld:
-                    # solved by manually checking valid TLDs
-                    return False
-                except whois.exceptions.FailedParsingWhoisOutput:
-                    # connection limit exceeded
-                    # todo should we do something about this?
-                    return False
-                except (whois.exceptions.WhoisCommandFailed, whois.exceptions.WhoisQuotaExceeded):
-                    # timeout while performing 'whois' command
-                    return False
-                except KeyError:
-                    # ocassionally occurs in whois/_3_adjust.py
+                except:
                     return False
 
         if not creation_date:
@@ -408,10 +405,14 @@ class Module(Module, multiprocessing.Process):
         __database__.publish('finished_modules', self.name)
 
     # GW
-    def get_gateway_using_ip_route(self):
+    def get_gateway_ip(self):
         """
-        Tries to get the default gateway IP address using ip route
+        Slips tries different ways to get the ip of the default gateway
+        this method tries to get the default gateway IP address using ip route
         """
+        if '-i' not in sys.argv:
+            return False
+
         gateway = False
         if platform.system() == 'Darwin':
             route_default_result = subprocess.check_output(
@@ -433,7 +434,6 @@ class Module(Module, multiprocessing.Process):
             gateway = route_default_result[2]
         return gateway
 
-
     def get_gateway_MAC(self, gw_ip):
         """
         Gets MAC from arp.log or from arp tables
@@ -446,8 +446,9 @@ class Module(Module, multiprocessing.Process):
             return MAC
 
         # we don't have it in arp.log
-        if not '-i' in sys.argv:
-            # no mac in arp.log and can't use arp table, so no way to get the MAC
+        running_on_interface = '-i' in sys.argv or __database__.is_growing_zeek_dir()
+        if not running_on_interface:
+            # no mac in arp.log and can't use arp table, so no way to get the gateway MAC
             return
 
         # get it using arp table
@@ -459,14 +460,44 @@ class Module(Module, multiprocessing.Process):
                 __database__.set_default_gateway('MAC', MAC)
                 return MAC
 
+    def check_if_we_have_pending_mac_queries(self):
+        """
+        Checks if we have pending queries in pending_mac_queries queue, and asks the db for them IF
+        update manager is done updating the mac db
+        """
+        if hasattr(self, 'mac_db') and not self.pending_mac_queries.empty():
+            while True:
+                try:
+                    mac, host_name, profileid = self.pending_mac_queries.get(timeout=0.5)
+                    self.get_vendor(mac, host_name, profileid)
+
+                except:
+                    # queue is empty
+                    return
+
+    def wait_for_dbs(self):
+        """
+        wait for update manager to finish updating the mac db and open the rest of dbs before starting this module
+        """
+        # this is the loop that controls te running on open_dbs
+        loop = asyncio.get_event_loop()
+        # run open_dbs in the background so we don't have
+        # to wait for update manager to finish updating the mac db to start this module
+        loop.run_until_complete(self.open_dbs())
 
 
     def run(self):
         utils.drop_root_privs()
+
+        self.wait_for_dbs()
+
+        if ip := self.get_gateway_ip():
+            __database__.set_default_gateway('IP', ip)
+
         # Main loop function
         while True:
             try:
-                message = self.c2.get_message(timeout=self.timeout)
+                message = __database__.get_message(self.c2)
                 if message and message['data'] == 'stop_process':
                     self.shutdown_gracefully()
                     return True
@@ -476,11 +507,13 @@ class Module(Module, multiprocessing.Process):
                     host_name = data.get('host_name', False)
                     profileid = data['profileid']
                     self.get_vendor(mac_addr, host_name, profileid)
+                    self.check_if_we_have_pending_mac_queries()
 
-                message = self.c3.get_message(timeout=self.timeout)
+                message = __database__.get_message(self.c3)
                 if message and message['data'] == 'stop_process':
                     self.shutdown_gracefully()
                     return True
+
                 if utils.is_msg_intended_for(message, 'new_dns_flow'):
                     data = message['data']
                     data = json.loads(data)
@@ -493,7 +526,7 @@ class Module(Module, multiprocessing.Process):
                     if domain := flow_data.get('query', False):
                         self.get_age(domain)
 
-                message = self.c1.get_message(timeout=self.timeout)
+                message = __database__.get_message(self.c1)
                 # if timewindows are not updated for a long time (see at logsProcess.py),
                 # we will stop slips automatically.The 'stop_process' line is sent from logsProcess.py.
                 if message and message['data'] == 'stop_process':
@@ -537,7 +570,7 @@ class Module(Module, multiprocessing.Process):
                         self.get_rdns(ip)
 
 
-                message = self.c4.get_message(timeout=self.timeout)
+                message = __database__.get_message(self.c4)
                 # if timewindows are not updated for a long time (see at logsProcess.py),
                 # we will stop slips automatically.The 'stop_process' line is sent from logsProcess.py.
                 if message and message['data'] == 'stop_process':
