@@ -93,6 +93,11 @@ class ConfigParser(object):
             return False
 
 
+    def get_anomaly_detection_mode(self):
+        return self.read_configuration(
+            'anomaly_detection', 'anomaly_detection_mode', 'training'
+        )
+
 
     def evidence_detection_threshold(self):
         threshold = self.read_configuration(
