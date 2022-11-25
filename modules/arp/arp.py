@@ -16,7 +16,7 @@ from multiprocessing import Queue
 class Module(Module, multiprocessing.Process):
     # Name: short name of the module. Do not use spaces
     name = 'ARP'
-    description = 'Detect arp attacks'
+    description = 'Detect ARP attacks'
     authors = ['Alya Gomaa']
 
     def __init__(self, outputqueue, redis_port):

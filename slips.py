@@ -510,16 +510,25 @@ class Main:
             self.print_stopped_module(module)
 
     def stop_core_processes(self):
-        self.kill('Input')
+        """
+        Kills profiler, input, output, logs
+        """
+        # we kill them because they don't use any channel
+        # or read the stop_process msg from any queue
+        # so there's no other way to tell it to stop other than sigkill
+        kill_manually = ('Input', 'Zeek')
+        for module in kill_manually:
+            self.kill(module)
+            self.print_stopped_module(module)
+
 
         if self.mode == 'daemonized':
             # when using -D, we kill the processes because
             # the queues are not there yet to send stop msgs
             for process in (
-                        'ProfilerProcess',
-                        'logsProcess',
-                        'OutputProcess'
-
+                        'Profiler',
+                        'Logs',
+                        'Output'
             ):
                 self.kill(process, INT=True)
 
@@ -694,11 +703,11 @@ class Main:
                 self.daemon.print(f'Total analyzed IPs: {profilesLen}.')
 
 
-            modules_to_be_killed_last = {
-                'EvidenceProcess',
+            modules_to_be_killed_last = [
+                'Evidence',
                 'Blocking',
                 'Exporting Alerts',
-            }
+            ]
 
             self.stop_core_processes()
             # only print that modules are still running once
@@ -1687,7 +1696,7 @@ class Main:
                 f'[PID {self.green(inputProcess.pid)}]', 1, 0
             )
             __database__.store_process_PID(
-                'Input Process',
+                'Input',
                 int(inputProcess.pid)
             )
             self.zeek_folder = inputProcess.zeek_folder
