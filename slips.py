@@ -722,13 +722,13 @@ class Main:
             # in the case of -S, slips doesn't even start the modules,
             # so they don't publish in finished_modules. we don't need to wait for them we have to kill them
             if not self.args.stopdaemon:
-                #  modules_to_be_killed_last are ignored when they publish a msg in finished modules channel,
-                # we will kill them aletr, so we shouldn't be looping and waiting for them to get outta the loop
-                slips_processes = len(list(self.PIDs.keys())) - len(modules_to_be_killed_last)
+                slips_processes = len(self.PIDs)
 
                 try:
+                    # keep waiting for modules to finish until all
+                    # slips_processes are marked as finished (in finished_modules)
                     while (
-                        len(finished_modules) < slips_processes  and max_loops != 0
+                        len(finished_modules) < slips_processes and max_loops != 0
                     ):
                         # print(f"Modules not finished yet {set(loaded_modules) - set(finished_modules)}")
                         try:
@@ -745,13 +745,8 @@ class Main:
                             # to confirm that all processing is done and we can safely exit now
                             module_name = message['data']
 
-                            if module_name in modules_to_be_killed_last:
-                                # we should kill these modules the very last, or else we'll miss evidence generated
-                                # right before slips stops
-                                continue
-
-
                             if module_name not in finished_modules:
+
                                 finished_modules.append(module_name)
                                 self.kill(module_name)
                                 self.print_stopped_module(module_name)
@@ -764,11 +759,29 @@ class Main:
                                     self.print_stopped_module(module)
 
                         max_loops -= 1
+
+                        # -t flag is only used in integration tests,
+                        # so we don't care about the modules finishing their job when testing
+                        # instead, kill them
+                        if self.args.testing:
+                            # to make sure the below if statement is never reached when testing
+                            # once max loops is over, kill all pending modules
+                            continue
+
+                        # are the only ones left, the modules to be killed last?
+                        modules_left: list = self.PIDs.keys() - modules_to_be_killed_last
                         # after reaching the max_loops and before killing the modules that aren't finished,
                         # make sure we're not processing
                         # the logical flow is self.pids should be empty by now as all modules
                         # are closed, the only ones left are the ones we want to kill last
-                        if len(self.PIDs) > len(modules_to_be_killed_last) and max_loops < 2:
+                        if len(modules_left) and max_loops == 0:
+                            # there are still pending modules, and they're not the ones that
+                            # should be killed yet (aka the ones that we send sigint to manually)
+                            # and we're done looping. so to give these pending module time to finish processing
+                            # delay killing them until all of them
+                            # are done processing
+                            max_loops += 1
+
                             if not warning_printed and self.warn_about_pending_modules(finished_modules):
                                 if 'Update Manager' not in finished_modules:
                                     print(
@@ -776,16 +789,6 @@ class Main:
                                         f"to finish updating 45+ TI files."
                                     )
                                 warning_printed = True
-
-                            # -t flag is only used in integration tests,
-                            # so we don't care about the modules finishing their job when testing
-                            # instead, kill them
-                            if self.args.testing:
-                                break
-
-                            # delay killing unstopped modules until all of them
-                            # are done processing
-                            max_loops += 1
 
                             # checks if 15 minutes has passed since the start of the function
                             if self.should_kill_all_modules(function_start_time, wait_for_modules_to_finish):
