@@ -11,7 +11,7 @@ import traceback
 # Your imports
 import numpy as np
 import sys
-from tensorflow.python.keras.models import load_model
+from tensorflow.keras.models import load_model
 
 
 warnings.filterwarnings('ignore', category=FutureWarning)

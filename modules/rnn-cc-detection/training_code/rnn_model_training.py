@@ -251,7 +251,7 @@ history = model.fit(
     epochs=args.epochs,
     batch_size=args.batch_size,
     validation_split=0.1,
-    verbose=1,
+    verbose=0,
     shuffle=True,
 )
 
