@@ -5,15 +5,13 @@
 
 
 echo "[+] Installing zeek ...\n"
-sudo apt get update
 sudo apt-get install cmake make gcc g++ flex bison libpcap-dev libssl-dev python3 python3-dev swig zlib1g-dev
 sudo apt install -y --no-install-recommends \
     wget \
     ca-certificates \
     git \
     curl \
-    gnupg \
-    lsb-core
+    gnupg
 
 
 version=$(lsb_release -r | cut -f2)
@@ -25,6 +23,7 @@ sudo apt update
 sudo apt install zeek
 
 
+# create a symlink to zeek so that slips can find it
 # create a symlink to zeek so that slips can find it
 echo "[+] Executing 'ln -s /opt/zeek/bin/zeek /usr/local/bin/bro'\n"
 sudo ln -s /opt/zeek/bin/zeek /usr/local/bin/bro
