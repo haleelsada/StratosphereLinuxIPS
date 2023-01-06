@@ -12,8 +12,13 @@ sudo apt install -y --no-install-recommends \
     git \
     curl \
     gnupg
-echo 'deb http://download.opensuse.org/repositories/security:/zeek/xUbuntu_20.04/ /' | sudo tee /etc/apt/sources.list.d/security:zeek.list
-curl -fsSL https://download.opensuse.org/repositories/security:zeek/xUbuntu_20.04/Release.key | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/security_zeek.gpg > /dev/null
+
+
+version=$(lsb_release -r | cut -f2)
+zeek_repo="http://download.opensuse.org/repositories/security:/zeek/xUbuntu_$version/"
+releasekey="http://download.opensuse.org/repositories/security:/zeek/xUbuntu_$version/Release.key"
+echo 'deb' "$zeek_repo" '/' | sudo tee /etc/apt/sources.list.d/security:zeek.list
+curl -fsSL "$releasekey" | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/security_zeek.gpg > /dev/null
 sudo apt update
 sudo apt install zeek
 
