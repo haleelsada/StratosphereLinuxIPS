@@ -183,7 +183,8 @@ class Module(Module, multiprocessing.Process):
                             3,
                             0,
                         )
-                        score = tcpmodel.predict(behavioral_model)
+                        # verbose = 0 to disable printing the time taken for each step
+                        score = tcpmodel.predict(behavioral_model, verbose=0)
                         self.print(
                             f' >> sequence: {pre_behavioral_model}. final prediction score: {score[0][0]:.20f}',
                             3,
