@@ -1087,22 +1087,24 @@ class Database(ProfilingFlowsDatabase, object):
         """
         When we have a bunch of evidence causing an alert,
         we associate all evidence IDs with the alert ID in our database
-        stores in 'alerts' key only
+        and store it in 'alerts' key
         :param alert ID: the profileid_twid_ID of the last evidence causing this alert
         :param evidence_IDs: all IDs of the evidence causing this alert
         """
-        old_profileid_twid_alerts: dict = self.get_profileid_twid_alerts(profileid, twid)
 
         alert = {
             alert_ID: json.dumps(evidence_IDs)
         }
 
-        # add the alert we have to the old alerts of this profileid_twid
-        profileid_twid_alerts: dict = old_profileid_twid_alerts | alert
-
-
-        profileid_twid_alerts = json.dumps(profileid_twid_alerts)
-        self.r.hset(f'{profileid}{self.separator}{twid}', 'alerts', profileid_twid_alerts)
+        old_profileid_twid_alerts: dict = self.get_profileid_twid_alerts(profileid, twid)
+        if old_profileid_twid_alerts:
+            # add the alert we have to the old alerts of this profileid_twid
+            profileid_twid_alerts: dict = old_profileid_twid_alerts.update(alert)
+            profileid_twid_alerts = json.dumps(profileid_twid_alerts)
+            self.r.hset(f'{profileid}{self.separator}{twid}', 'alerts', profileid_twid_alerts)
+        else:
+            # there's no past alerts in this profileid and twid, store this alert only
+            self.r.hset(f'{profileid}{self.separator}{twid}', 'alerts', json.dumps(alert))
 
         # the structure of alerts key is
         # alerts {
@@ -1112,10 +1114,10 @@ class Database(ProfilingFlowsDatabase, object):
         #                   alert_ID2: [evidence_IDs]
         #                  }
         #             }
-        # }
+        #
 
         profile_alerts = self.r.hget('alerts', profileid)
-        # alert ids look like this profile_192.168.131.2_timewindow1_92a3b9c2-330b-47ab-b73e-c5380af90439
+        # alert_ID looks like this profile_192.168.131.2_timewindow1_92a3b9c2-330b-47ab-b73e-c5380af90439
         alert_hash = alert_ID.split('_')[-1]
         alert = {
             twid: {
