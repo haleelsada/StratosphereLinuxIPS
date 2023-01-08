@@ -877,4 +877,5 @@ class EvidenceProcess(multiprocessing.Process):
                 )
                 self.outputqueue.put('01|[Evidence] {}'.format(type(inst)))
                 self.outputqueue.put('01|[Evidence] {}'.format(inst))
+                self.print(traceback.format_exc())
                 return True
