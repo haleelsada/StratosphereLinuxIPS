@@ -825,5 +825,7 @@ class EvidenceProcess(multiprocessing.Process):
                 self.outputqueue.put(
                     f'01|[Evidence] Error in the Evidence Process line {exception_line}'
                 )
-                self.outputqueue.put('01|[Evidence] {}'.format(traceback.print_exc()))
+                self.outputqueue.put('01|[Evidence] {}'.format(type(inst)))
+                self.outputqueue.put('01|[Evidence] {}'.format(inst))
+                self.print(traceback.format_exc())
                 return True
