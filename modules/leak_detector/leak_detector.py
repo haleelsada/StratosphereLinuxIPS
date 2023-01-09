@@ -6,7 +6,6 @@ from slips_files.common.slips_utils import utils
 import sys
 
 # Your imports
-from subprocess import check_output
 import base64
 import time
 import binascii
