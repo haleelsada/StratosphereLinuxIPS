@@ -5,13 +5,14 @@
 
 
 echo "[+] Installing zeek ...\n"
-sudo apt get update
-sudo apt-get install cmake make gcc g++ flex bison libpcap-dev libssl-dev python3 python3-dev swig zlib1g-dev
+sudo apt update
+sudo apt-get install -y cmake make gcc g++ flex bison libpcap-dev libssl-dev python3 python3-dev swig zlib1g-dev
 sudo apt install -y --no-install-recommends \
     wget \
     ca-certificates \
     git \
     curl \
+    gpg \
     gnupg \
     lsb-core
 
@@ -22,15 +23,14 @@ releasekey="http://download.opensuse.org/repositories/security:/zeek/xUbuntu_$ve
 echo 'deb' "$zeek_repo" '/' | sudo tee /etc/apt/sources.list.d/security:zeek.list
 curl -fsSL "$releasekey" | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/security_zeek.gpg > /dev/null
 sudo apt update
-sudo apt install zeek
+sudo apt install -y zeek
 
 
-# create a symlink to zeek so that slips can find it
-echo "[+] Executing 'ln -s /opt/zeek/bin/zeek /usr/local/bin/bro'\n"
+echo "[+] Creating a symlink to zeek so that slips can find it \n"
 sudo ln -s /opt/zeek/bin/zeek /usr/local/bin/bro
-echo "[+] Executing 'export PATH=$PATH:/usr/local/zeek/bin'\n"
+
+echo "[+] Adding zeek to PATH \n"
 export PATH=$PATH:/usr/local/zeek/bin
-echo "[+] Adding /usr/local/zeek/bin to ~/.bashrc\n"
 echo "export PATH=$PATH:/usr/local/zeek/bin" >> ~/.bashrc
 
 
