@@ -342,7 +342,7 @@ class Database(ProfilingFlowsDatabase, object):
             if self.r.sismember('profiles', str(profileid)):
                 # we already have this profile
                 return False
-            # execlude ips outside of local network is it's set in slips.conf 
+            # execlude ips outside of local network is it's set in slips.conf
             if not self.should_add(profileid):
                 return False
             # Add the profile to the index. The index is called 'profiles'
@@ -465,6 +465,18 @@ class Database(ProfilingFlowsDatabase, object):
         # check if it's already marked as dhcp
         if not is_dhcp_set:
             self.r.hset(profileid, 'dhcp', 'true')
+
+
+    def mark_profile_as_gateway(self, profileid):
+        """
+        Used to mark this profile as dhcp server
+        """
+        if not profileid:
+            # profileid is None if we're dealing with a profile
+            # outside of home_network when this param is given
+            return False
+
+        self.r.hset(profileid, 'gateway', 'true')
 
 
     def set_ipv6_of_profile(self, profileid, ip: list):
@@ -1078,24 +1090,27 @@ class Database(ProfilingFlowsDatabase, object):
         """
         When we have a bunch of evidence causing an alert,
         we associate all evidence IDs with the alert ID in our database
-        and store it in 'alerts' key
+        this function stores evidence in 'alerts' key only
         :param alert ID: the profileid_twid_ID of the last evidence causing this alert
         :param evidence_IDs: all IDs of the evidence causing this alert
         """
+        old_profileid_twid_alerts: dict = self.get_profileid_twid_alerts(profileid, twid)
 
         alert = {
             alert_ID: json.dumps(evidence_IDs)
         }
 
-        old_profileid_twid_alerts: dict = self.get_profileid_twid_alerts(profileid, twid)
         if old_profileid_twid_alerts:
+            # update previous alerts for this profileid twid
             # add the alert we have to the old alerts of this profileid_twid
-            profileid_twid_alerts: dict = old_profileid_twid_alerts.update(alert)
-            profileid_twid_alerts = json.dumps(profileid_twid_alerts)
-            self.r.hset(f'{profileid}{self.separator}{twid}', 'alerts', profileid_twid_alerts)
+            old_profileid_twid_alerts.update(alert)
+            profileid_twid_alerts = json.dumps(old_profileid_twid_alerts)
         else:
-            # there's no past alerts in this profileid and twid, store this alert only
-            self.r.hset(f'{profileid}{self.separator}{twid}', 'alerts', json.dumps(alert))
+            # no previous alerts for this profileid twid
+            profileid_twid_alerts = json.dumps(alert)
+
+
+        self.r.hset(f'{profileid}{self.separator}{twid}', 'alerts', profileid_twid_alerts)
 
         # the structure of alerts key is
         # alerts {
@@ -1105,10 +1120,10 @@ class Database(ProfilingFlowsDatabase, object):
         #                   alert_ID2: [evidence_IDs]
         #                  }
         #             }
-        #
+        # }
 
         profile_alerts = self.r.hget('alerts', profileid)
-        # alert_ID looks like this profile_192.168.131.2_timewindow1_92a3b9c2-330b-47ab-b73e-c5380af90439
+        # alert ids look like this profile_192.168.131.2_timewindow1_92a3b9c2-330b-47ab-b73e-c5380af90439
         alert_hash = alert_ID.split('_')[-1]
         alert = {
             twid: {
@@ -1326,6 +1341,22 @@ class Database(ProfilingFlowsDatabase, object):
         return False
 
 
+    def set_flow_causing_evidence(self, uid, evidence_ID):
+        """
+        :param uid: can be a str or a list
+        """
+        if type(uid) == str:
+            uid = [uid]
+        self.r.hset("flows_causing_evidence", evidence_ID, json.dumps(uid))
+
+    def get_flows_causing_evidence(self, evidence_ID) -> list:
+        uids = self.r.hget("flows_causing_evidence", evidence_ID)
+        if not uids:
+            return []
+        else:
+            return json.loads(uids)
+
+
     def setEvidence(
             self,
             evidence_type,
@@ -1378,6 +1409,7 @@ class Database(ProfilingFlowsDatabase, object):
         # every evidence should have an ID according to the IDEA format
         evidence_ID = str(uuid4())
 
+        self.set_flow_causing_evidence(uid, evidence_ID)
 
         # some evidence are caused by several uids, use the last one only
         if type(uid) == list:
@@ -1680,9 +1712,9 @@ class Database(ProfilingFlowsDatabase, object):
         identification = ''
         if current_data:
             if 'asn' in current_data:
-                asn = current_data['asn']['asnorg']
-                if 'Unknown' not in asn and asn != '':
-                    identification += 'AS: ' + asn + ', '
+                asnorg = current_data['asn']['org']
+                number = current_data['asn'].get('number', '')
+                identification += f'AS: {asnorg} {number}, '
 
             if 'SNI' in current_data:
                 SNI = current_data['SNI']
@@ -1990,6 +2022,9 @@ class Database(ProfilingFlowsDatabase, object):
     def get_gateway_MAC(self):
         return self.r.hget('default_gateway', 'MAC')
 
+    def get_gateway_MAC_Vendor(self):
+        return self.r.hget('default_gateway', 'Vendor')
+
     def set_default_gateway(self, address_type:str, address:str):
         """
         :param address_type: can either be 'IP' or 'MAC'
@@ -1999,6 +2034,7 @@ class Database(ProfilingFlowsDatabase, object):
         if (
                 address_type == 'IP' and not self.get_gateway_ip()
                 or address_type == 'MAC' and not self.get_gateway_MAC()
+                or address_type == 'Vendor' and not self.get_gateway_MAC_Vendor()
         ):
             self.r.hset('default_gateway', address_type, address)
 
@@ -2080,6 +2116,19 @@ class Database(ProfilingFlowsDatabase, object):
         """
         if malicious_ip_ranges:
             self.rcache.hmset('IoC_ip_ranges', malicious_ip_ranges)
+
+    def add_asn_to_IoC(self, blacklisted_ASNs: dict):
+        """
+        Store a group of ASN in the db as they were obtained from an IoC source
+        :param blacklisted_ASNs: is {asn: json.dumps{'source':..,'tags':..,
+                                                     'threat_level':... ,'description'}}
+        """
+        if blacklisted_ASNs:
+            self.rcache.hmset('IoC_ASNs', blacklisted_ASNs)
+
+    def is_blacklisted_ASN(self, ASN) -> bool:
+        return self.rcache.hget('IoC_ASNs', ASN)
+
 
     def add_ja3_to_IoC(self, ja3_dict) -> None:
         """
@@ -2355,17 +2404,59 @@ class Database(ProfilingFlowsDatabase, object):
     def delete_file_info(self, file):
         self.rcache.hdel('TI_files_info', file)
 
-    def set_asn_cache(self, asn: str, asn_range: str) -> None:
+    def set_asn_cache(self, org: str, asn_range: str, asn_number: str) -> None:
         """
         Stores the range of asn in cached_asn hash
         """
-        self.rcache.hset('cached_asn', asn, asn_range)
 
-    def get_asn_cache(self):
+        range_info = {
+            asn_range: {
+                'org': org
+            }
+        }
+        if asn_number:
+            range_info[asn_range].update(
+                {'number': f'AS{asn_number}'}
+            )
+
+        first_octet = utils.get_first_octet(asn_range)
+        if not first_octet:
+            return
+
+        # this is how we store ASNs; sorted by first octet
         """
+        {
+            '192' : {
+                '192.168.1.0/x': {'number': 'AS123', 'org':'Test'},
+                '192.168.1.0/x': {'number': 'AS123', 'org':'Test'},
+            },
+            '10': {
+                '10.0.0.0/x': {'number': 'AS123', 'org':'Test'},
+            }
+            
+        }
+        """
+        # get all the ranges in our cache that start witht hte same octet
+        cached_asn:str = self.get_asn_cache(first_octet=first_octet)
+        if cached_asn:
+            # we already have a cached asn of a range that starts with the same first octet
+            cached_asn: dict = json.loads(cached_asn)
+            cached_asn.update(range_info)
+            self.rcache.hset('cached_asn', first_octet, json.dumps(cached_asn))
+        else:
+            # first time storing a range starting with the same first octet
+            self.rcache.hset('cached_asn', first_octet, json.dumps(range_info))
+
+    def get_asn_cache(self, first_octet=False):
+        """
+         cached ASNs are sorted by first octet
         Returns cached asn of ip if present, or False.
         """
-        return self.rcache.hgetall('cached_asn')
+        if first_octet:
+            return self.rcache.hget('cached_asn', first_octet)
+        else:
+            return self.rcache.hgetall('cached_asn')
+
 
     def store_process_PID(self, process, pid):
         """

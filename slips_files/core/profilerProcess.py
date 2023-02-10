@@ -44,6 +44,7 @@ class ProfilerProcess(multiprocessing.Process):
         self.outputqueue = outputqueue
         self.timeformat = None
         self.input_type = False
+        self.last_processed_line = ''
         self.whitelist = Whitelist(outputqueue, redis_port)
         # Read the configuration
         self.read_configuration()
@@ -610,7 +611,6 @@ class ProfilerProcess(multiprocessing.Process):
             self.column_values['requested_addr'] = line[8]
             self.column_values['saddr'] = self.column_values['client_addr']
             self.column_values['daddr'] = self.column_values['server_addr']
-
         elif 'dce_rpc' in new_line['type']:
             self.column_values['type'] = 'dce_rpc'
         elif 'dnp3' in new_line['type']:
@@ -736,7 +736,6 @@ class ProfilerProcess(multiprocessing.Process):
         self.column_values = {}
         # We need to set it to empty at the beginning so any new flow has the key 'type'
         self.column_values['type'] = ''
-
         # to set the default value to '' if ts isn't found
         ts = line.get('ts', False)
         if ts:
@@ -878,7 +877,6 @@ class ProfilerProcess(multiprocessing.Process):
                     'requested_addr': line.get('requested_addr', ''),
                 }
             )
-
             # self.column_values['domain'] = line.get('domain','')
             # self.column_values['assigned_addr'] = line.get('assigned_addr','')
 
@@ -1223,7 +1221,7 @@ class ProfilerProcess(multiprocessing.Process):
             pass
 
     def process_suricata_input(self, line) -> None:
-        """Read suricata json input"""
+        """Read suricata json input and store it in column_values"""
 
         # convert to dict if it's not a dict already
         if type(line) == str:
@@ -1261,7 +1259,7 @@ class ProfilerProcess(multiprocessing.Process):
 
         if self.column_values['type']:
             """
-            event_type:
+            suricata available event_type values:
             -flow
             -tls
             -http
@@ -1639,6 +1637,7 @@ class ProfilerProcess(multiprocessing.Process):
         }
         __database__.publish('new_dhcp', json.dumps(to_send))
 
+
     def publish_to_new_software(self):
         """
         Send the whole flow to new_software channel
@@ -1885,6 +1884,11 @@ class ProfilerProcess(multiprocessing.Process):
                 self.uid,
         )
 
+        if 'Gateway_addr_identified' in self.column_values['note']:
+            # get the gw addr form the msg
+            gw_addr = self.column_values['msg'].split(': ')[-1].strip()
+            __database__.set_default_gateway("IP", gw_addr)
+
     def handle_ftp(self):
         used_port = self.column_values['used_port']
         if used_port:
@@ -1934,10 +1938,9 @@ class ProfilerProcess(multiprocessing.Process):
                 host_name=(self.column_values.get('host_name', False))
             )
         server_addr = self.column_values.get('server_addr', False)
+
         if server_addr:
             __database__.store_dhcp_server(server_addr)
-            # override the gw IP in the db since we have a dhcp
-            __database__.set_default_gateway("IP", server_addr)
             __database__.mark_profile_as_dhcp(self.profileid)
 
         self.publish_to_new_dhcp()
@@ -2439,10 +2442,15 @@ class ProfilerProcess(multiprocessing.Process):
                         # When the columns are not there. Not sure if it works
                         self.define_columns(line)
                 elif self.input_type == 'suricata':
-                    # self.print('Suricata line')
+                    # make sure that we haven't processed this line before
+                    if line == self.last_processed_line:
+                        # temporary fix for slips processing the last line of suricata files 2000+ times in a row!
+                        continue
                     self.process_suricata_input(line)
                     # Add the flow to the profile
                     self.add_flow_to_profile()
+                    self.last_processed_line = line
+
                 elif self.input_type == 'zeek-tabs':
                     # self.print('Zeek-tabs line')
                     self.process_zeek_tabs_input(line)

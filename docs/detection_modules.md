@@ -277,13 +277,21 @@ Slips is shipped with the Abuse.ch SSL feed by default,
 
 You can add your own SSL feed by appending to the ```ssl_feeds``` key in ```config/slips.conf```
 
+### Matching of ASNs
+
+Every time Slips sees a new IP, it stores info about it in the db, for example its organization, RDNs, and ASN.
+If the ASN of an IP matches a blacklisted ASN, slips alerts.
+
+Blacklisted ASNs are read from out local TI file ```config/local_data_files/own_malicious_iocs.csv```, 
+so you can update them or add your own.
+
 ### Local Threat Intelligence files
 
 Slips has a local file for adding IoCs of your own, 
 it's located in ```config/local_data_files/own_malicious_iocs.csv``` by default,
 this path can be changed by changing ```download_path_for_local_threat_intelligence``` in ```config/slips.conf```.
 
-The format of the file is "IP address/IP Range/domain","Threat level", "Description"
+The format of the file is "IP address/IP Range/domain/ASN","Threat level", "Description"
 
 Threat level available options: info, low, medium, high, critical
 
@@ -567,24 +575,12 @@ In order for this module to run you need:
   <li>tshark</li>
 </ul>
 
-You can compile YARA by running
-
-`wget https://github.com/VirusTotal/yara/archive/refs/tags/v4.1.3.tar.gz 
-  && tar -zxf v4.1.3.tar.gz 
-  && cd yara-4.1.3 
-  && ./bootstrap.sh 
-  && ./configure 
-  && make 
-  && make install`
-
-You can install yara-python by running
-
-`git clone https://github.com/VirusTotal/yara-python yara-python && cd yara-python
-python3 setup.py build && python3 setup.py install`
+using 
+```sudo apt install yara```
 
 You can install tshark by running
 
-`apt install wireshark`
+`sudo apt install wireshark`
 
 
 ### How it works
@@ -700,5 +696,11 @@ and ICMP-AddressMaskScan based on the icmp type
 
 We detect a scan every threshold. So we generate an evidence when there is 
 5,10,15, .. etc. ICMP established connections to different IPs.
+
+
+### Detect the Gateway address
+
+The ```zeek-scripts/log_gw.zeek``` script is responsible for recognizing the gateway address using zeek, and logging it to
+notice.log
 
 
